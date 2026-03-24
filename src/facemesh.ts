@@ -82,17 +82,21 @@ export async function createFacemesh(options: FacemeshOptions = {}): Promise<Fac
   const [landmarkMeta, landmarkBuf, detectorMeta, detectorBuf] = await Promise.all([
     landmarkMetaRes.json() as Promise<WeightsMetadata>,
     landmarkBinRes.arrayBuffer(),
-    detectorMetaRes.json() as Promise<Array<{ key: string; shape: number[]; offset: number; size: number }>>,
+    detectorMetaRes.json() as Promise<WeightsMetadata>,
     detectorBinRes.arrayBuffer(),
   ]);
 
   const landmarkWeights = loadFaceLandmarkWeights(landmarkMeta, landmarkBuf);
 
-  // Load detector weights using its own format
+  // Load detector weights using same keys/shapes/offsets format
   const detectorWeights = new Map<string, { data: Float32Array; shape: number[] }>();
-  for (const entry of detectorMeta) {
-    const data = new Float32Array(detectorBuf, entry.offset, entry.size / 4);
-    detectorWeights.set(entry.key, { data, shape: entry.shape });
+  for (let i = 0; i < detectorMeta.keys.length; i++) {
+    const key = detectorMeta.keys[i]!;
+    const shape = detectorMeta.shapes[i]!;
+    const offset = detectorMeta.offsets[i]!;
+    const size = shape.reduce((a, b) => a * b, 1);
+    const data = new Float32Array(detectorBuf, offset, size);
+    detectorWeights.set(key, { data, shape });
   }
 
   // Compile face detector model
