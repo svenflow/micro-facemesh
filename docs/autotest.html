@@ -75,7 +75,7 @@
 
       const initT0 = performance.now();
       const facemesh = await createFacemesh({
-        weightsBase: './weights',
+        weightsUrl: './weights',
         scoreThreshold: 0.5,
       });
       const initMs = (performance.now() - initT0).toFixed(0);
