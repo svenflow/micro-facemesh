@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>micro-facemesh autotest</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0a0a0a; color: #ededed; font-family: 'SF Mono', 'Menlo', monospace; padding: 12px; font-size: 13px; }
+    h2 { font-family: system-ui; margin-bottom: 8px; font-size: 18px; }
+    .row { display: flex; gap: 4px; align-items: baseline; padding: 2px 0; }
+    .label { color: #888; min-width: 140px; }
+    .val { font-weight: 600; }
+    .ok { color: #34d399; }
+    .err { color: #ef4444; }
+    .num { color: #60a5fa; }
+    .dim { color: #555; }
+    hr { border: none; border-top: 1px solid #222; margin: 8px 0; }
+    canvas { max-width: 300px; border: 1px solid #333; margin: 6px 0; border-radius: 4px; }
+    #log { line-height: 1.5; }
+    .section { margin: 10px 0 4px 0; font-weight: 700; font-size: 14px; color: #7c6aef; }
+    .error-box { background: #1a0505; border: 1px solid #ef4444; padding: 8px; border-radius: 4px; margin: 8px 0; }
+  </style>
+</head>
+<body>
+  <h2>micro-facemesh autotest 🧑</h2>
+  <div id="log"></div>
+
+  <script type="module">
+    const log = document.getElementById('log');
+    function div(cls, html) {
+      const d = document.createElement('div');
+      d.className = cls;
+      d.innerHTML = html;
+      log.appendChild(d);
+      window.scrollTo(0, document.body.scrollHeight);
+      return d;
+    }
+    function row(label, value, cls = '') {
+      div('row', `<span class="label">${label}</span><span class="val ${cls}">${value}</span>`);
+    }
+    function section(title) { div('section', title); }
+    function hr_() { log.appendChild(document.createElement('hr')); }
+
+    async function run() {
+      section('SYSTEM');
+      row('UA', navigator.userAgent.substring(0, 80));
+      row('Screen', `${screen.width}x${screen.height} @${devicePixelRatio}x`);
+      row('WebGPU', navigator.gpu ? 'YES' : 'NO', navigator.gpu ? 'ok' : 'err');
+
+      if (!navigator.gpu) {
+        div('error-box', 'WebGPU not available');
+        return;
+      }
+
+      // Load test image
+      hr_();
+      section('LOAD IMAGE');
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = () => reject(new Error('Image load failed'));
+        img.src = 'https://images.pexels.com/photos/3885344/pexels-photo-3885344.jpeg?auto=compress&cs=tinysrgb&w=800';
+      });
+      row('Image', `${img.naturalWidth}x${img.naturalHeight}`, 'ok');
+
+      // Load micro-facemesh
+      hr_();
+      section('LOAD MICRO-FACEMESH');
+
+      // Use local build for testing (relative import)
+      const { createFacemesh } = await import('./dist/index.js');
+      row('Module', 'loaded', 'ok');
+
+      const initT0 = performance.now();
+      const facemesh = await createFacemesh({
+        weightsBase: './weights',
+        scoreThreshold: 0.5,
+      });
+      const initMs = (performance.now() - initT0).toFixed(0);
+      row('Init', initMs + 'ms', 'num');
+
+      // Create ImageBitmap
+      const bmp = await createImageBitmap(img);
+
+      // Warmup
+      hr_();
+      section('WARMUP');
+      const warmT0 = performance.now();
+      const warmResult = await facemesh.detect(bmp);
+      row('Warmup', (performance.now() - warmT0).toFixed(0) + 'ms', 'dim');
+      row('Faces found', warmResult.length.toString(), warmResult.length > 0 ? 'ok' : 'err');
+
+      if (warmResult.length > 0) {
+        row('Score', warmResult[0].score.toFixed(4), 'num');
+        row('Landmarks', warmResult[0].landmarks.length.toString(), 'num');
+      }
+
+      // Draw
+      const canvas = document.createElement('canvas');
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+
+      if (warmResult.length > 0) {
+        ctx.fillStyle = '#34d399';
+        for (const lm of warmResult[0].landmarks) {
+          ctx.beginPath();
+          ctx.arc(lm.x * canvas.width, lm.y * canvas.height, 1.5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+      log.appendChild(canvas);
+
+      // Benchmark
+      hr_();
+      section('BENCHMARK (5 runs)');
+      const times = [];
+      for (let i = 0; i < 5; i++) {
+        facemesh.reset();
+        const t0 = performance.now();
+        await facemesh.detect(bmp);
+        times.push(performance.now() - t0);
+      }
+
+      const sorted = [...times].sort((a, b) => a - b);
+      const avg = times.reduce((s, t) => s + t, 0) / times.length;
+      const median = sorted[2];
+      row('Avg', avg.toFixed(1) + 'ms', 'num');
+      row('Median', median.toFixed(1) + 'ms', 'num');
+      row('Min', sorted[0].toFixed(1) + 'ms', 'num');
+      row('Max', sorted[4].toFixed(1) + 'ms', 'num');
+      row('FPS', (1000 / median).toFixed(1), 'num');
+
+      hr_();
+      row('Status', warmResult.length > 0 ? 'ALL PASSED' : 'FAILED - no faces detected',
+        warmResult.length > 0 ? 'ok' : 'err');
+    }
+
+    run().catch(e => div('error-box', `Fatal: ${e.message}<br><pre>${e.stack}</pre>`));
+  </script>
+</body>
+</html>
