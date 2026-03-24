@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Face Detector Debug</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0a0a0a; color: #ededed; font-family: 'SF Mono', 'Menlo', monospace; padding: 12px; font-size: 13px; }
+    h2 { font-family: system-ui; margin-bottom: 8px; font-size: 18px; }
+    .row { display: flex; gap: 4px; align-items: baseline; padding: 2px 0; }
+    .label { color: #888; min-width: 180px; }
+    .val { font-weight: 600; }
+    .ok { color: #34d399; }
+    .err { color: #ef4444; }
+    .warn { color: #fbbf24; }
+    .num { color: #60a5fa; }
+    .dim { color: #555; }
+    hr { border: none; border-top: 1px solid #222; margin: 8px 0; }
+    canvas { max-width: 400px; border: 1px solid #333; margin: 6px 0; border-radius: 4px; }
+    #log { line-height: 1.5; }
+    .section { margin: 10px 0 4px 0; font-weight: 700; font-size: 14px; color: #7c6aef; }
+    .error-box { background: #1a0505; border: 1px solid #ef4444; padding: 8px; border-radius: 4px; margin: 8px 0; white-space: pre-wrap; }
+    .warn-box { background: #1a1505; border: 1px solid #fbbf24; padding: 8px; border-radius: 4px; margin: 8px 0; }
+    .info-box { background: #050a1a; border: 1px solid #60a5fa; padding: 8px; border-radius: 4px; margin: 8px 0; font-size: 12px; }
+    table { border-collapse: collapse; margin: 6px 0; font-size: 12px; }
+    table th, table td { border: 1px solid #333; padding: 3px 8px; text-align: right; }
+    table th { background: #1a1a2e; color: #7c6aef; }
+    table td { background: #111; }
+    .canvas-pair { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-start; }
+    .canvas-label { color: #888; font-size: 11px; margin-bottom: 2px; }
+  </style>
+</head>
+<body>
+  <h2>Face Detector Debug</h2>
+  <div id="log"></div>
+
+  <script type="module">
+    import {
+      compileFaceDetectorModel,
+      createFaceDetector,
+    } from './dist/index.js';
+
+    const log = document.getElementById('log');
+
+    function div(cls, html) {
+      const d = document.createElement('div');
+      d.className = cls;
+      d.innerHTML = html;
+      log.appendChild(d);
+      window.scrollTo(0, document.body.scrollHeight);
+      return d;
+    }
+    function row(label, value, cls = '') {
+      div('row', `<span class="label">${label}</span><span class="val ${cls}">${value}</span>`);
+    }
+    function section(title) { div('section', title); }
+    function hr_() { log.appendChild(document.createElement('hr')); }
+
+    function addCanvas(width, height, label) {
+      if (label) {
+        div('canvas-label', label);
+      }
+      const c = document.createElement('canvas');
+      c.width = width;
+      c.height = height;
+      log.appendChild(c);
+      return c;
+    }
+
+    function addTable(headers, rows) {
+      let html = '<table><tr>' + headers.map(h => `<th>${h}</th>`).join('') + '</tr>';
+      for (const r of rows) {
+        html += '<tr>' + r.map(v => `<td>${v}</td>`).join('') + '</tr>';
+      }
+      html += '</table>';
+      div('', html);
+    }
+
+    // Sigmoid
+    function sigmoid(x) {
+      return 1 / (1 + Math.exp(-x));
+    }
+
+    // Generate anchors (matching face_detector.ts)
+    function generateAnchors() {
+      const anchors = [];
+      for (let y = 0; y < 16; y++) {
+        for (let x = 0; x < 16; x++) {
+          const cx = (x + 0.5) / 16;
+          const cy = (y + 0.5) / 16;
+          for (let a = 0; a < 2; a++) {
+            anchors.push({ x: cx, y: cy });
+          }
+        }
+      }
+      for (let y = 0; y < 8; y++) {
+        for (let x = 0; x < 8; x++) {
+          const cx = (x + 0.5) / 8;
+          const cy = (y + 0.5) / 8;
+          for (let a = 0; a < 6; a++) {
+            anchors.push({ x: cx, y: cy });
+          }
+        }
+      }
+      return anchors;
+    }
+
+    async function run() {
+      section('SYSTEM');
+      row('WebGPU', navigator.gpu ? 'YES' : 'NO', navigator.gpu ? 'ok' : 'err');
+      if (!navigator.gpu) {
+        div('error-box', 'WebGPU not available');
+        return;
+      }
+
+      // ============ Load test image ============
+      hr_();
+      section('LOAD IMAGE');
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = () => reject(new Error('Image load failed'));
+        img.src = 'https://images.pexels.com/photos/3885344/pexels-photo-3885344.jpeg?auto=compress&cs=tinysrgb&w=800';
+      });
+      row('Image size', `${img.naturalWidth}x${img.naturalHeight}`, 'ok');
+
+      // Show original image
+      const imgCanvas = addCanvas(img.naturalWidth, img.naturalHeight, 'Original image');
+      imgCanvas.style.maxWidth = '300px';
+      const imgCtx = imgCanvas.getContext('2d');
+      imgCtx.drawImage(img, 0, 0);
+
+      // ============ Load weights directly ============
+      hr_();
+      section('LOAD WEIGHTS');
+      const t0 = performance.now();
+
+      const [metaRes, binRes] = await Promise.all([
+        fetch('./weights/face_detector_weights.json'),
+        fetch('./weights/face_detector_weights.bin'),
+      ]);
+      if (!metaRes.ok || !binRes.ok) {
+        div('error-box', `Failed to load weights: meta=${metaRes.status} bin=${binRes.status}`);
+        return;
+      }
+
+      const meta = await metaRes.json();
+      const bin = await binRes.arrayBuffer();
+
+      // Parse weights into Map (matching facemesh.ts approach)
+      const weights = new Map();
+      for (let i = 0; i < meta.keys.length; i++) {
+        const key = meta.keys[i];
+        const shape = meta.shapes[i];
+        const offset = meta.offsets[i];
+        const size = shape.reduce((a, b) => a * b, 1);
+        const data = new Float32Array(bin, offset, size);
+        weights.set(key, { data, shape });
+      }
+      row('Weight keys', weights.size, 'num');
+
+      // Show weight names and shapes
+      const weightRows = [];
+      for (const [key, tensor] of weights) {
+        weightRows.push([key, tensor.shape.join('x'), tensor.data.length.toString()]);
+      }
+      addTable(['Key', 'Shape', 'Elements'], weightRows.slice(0, 10));
+      if (weightRows.length > 10) {
+        row('', `... and ${weightRows.length - 10} more weights`, 'dim');
+      }
+
+      // ============ Compile model ============
+      hr_();
+      section('COMPILE MODEL');
+      const compileT0 = performance.now();
+      const model = await compileFaceDetectorModel(weights);
+      const compileMs = (performance.now() - compileT0).toFixed(0);
+      row('Compile time', compileMs + 'ms', 'num');
+      row('Device', model.device ? 'OK' : 'MISSING', model.device ? 'ok' : 'err');
+
+      // ============ Create face detector ============
+      const detector = createFaceDetector(model, {
+        scoreThreshold: 0.01,  // Very low threshold for debugging
+        nmsThreshold: 0.3,
+        maxFaces: 10,
+      });
+
+      // ============ Inspect input preprocessing ============
+      hr_();
+      section('INPUT PREPROCESSING');
+
+      // Create ImageBitmap from the test image
+      const bmp = await createImageBitmap(img);
+      row('ImageBitmap', `${bmp.width}x${bmp.height}`, 'ok');
+
+      // Check what value range the shader produces
+      div('info-box', `FACE_CANVAS_INPUT_SHADER: reads pixel.r/g/b from rgba8unorm texture (range [0, 1])
+FACE_LETTERBOX_RESIZE_SHADER: reads pixel.r/g/b via textureSampleLevel (range [0, 1])
+
+BlazeFace expects input in [-1, 1] range (standard: pixel * 2.0 / 255.0 - 1.0 = pixel_01 * 2.0 - 1.0).
+Both shaders output [0, 1] -- NO [-1, 1] normalization is applied.
+
+This means the model receives values in [0, 1] instead of [-1, 1].
+This could be the cause of 0 detections if the model was trained on [-1, 1] range.`);
+
+      // ============ Run raw SSD inference ============
+      hr_();
+      section('RAW SSD OUTPUT');
+      const inferT0 = performance.now();
+      const { scores, regressors, lbPadX, lbPadY } = await detector.detectRawSSD(bmp, bmp.width, bmp.height);
+      const inferMs = (performance.now() - inferT0).toFixed(1);
+      row('Inference time', inferMs + 'ms', 'num');
+      row('Scores shape', `[${scores.length}]`, 'num');
+      row('Regressors shape', `[${regressors.length}] = [${scores.length} x 16]`, 'num');
+      row('Letterbox padX', lbPadX.toFixed(4), 'num');
+      row('Letterbox padY', lbPadY.toFixed(4), 'num');
+
+      // ============ Analyze raw classifier scores (before sigmoid) ============
+      hr_();
+      section('RAW CLASSIFIER SCORES (before sigmoid)');
+
+      // Basic statistics
+      let minScore = Infinity, maxScore = -Infinity, sumScore = 0;
+      for (let i = 0; i < scores.length; i++) {
+        const v = scores[i];
+        if (v < minScore) minScore = v;
+        if (v > maxScore) maxScore = v;
+        sumScore += v;
+      }
+      const avgScore = sumScore / scores.length;
+      row('Min raw score', minScore.toFixed(6), 'num');
+      row('Max raw score', maxScore.toFixed(6), maxScore > 0 ? 'ok' : 'err');
+      row('Avg raw score', avgScore.toFixed(6), 'num');
+
+      // Check for all-zero or all-negative
+      let zeroCount = 0, positiveCount = 0, negativeCount = 0;
+      for (let i = 0; i < scores.length; i++) {
+        if (scores[i] === 0) zeroCount++;
+        else if (scores[i] > 0) positiveCount++;
+        else negativeCount++;
+      }
+      row('Zero scores', zeroCount, zeroCount === scores.length ? 'err' : 'num');
+      row('Positive scores', positiveCount, 'num');
+      row('Negative scores', negativeCount, 'num');
+
+      if (maxScore < -5) {
+        div('warn-box', 'WARNING: All raw scores are very negative. This strongly suggests a preprocessing issue (wrong input range) or broken weights/shaders.');
+      } else if (maxScore < 0) {
+        div('warn-box', 'WARNING: Max raw score is negative. After sigmoid, max confidence = ' + sigmoid(maxScore).toFixed(4) + '. No detections will pass even a 0.5 threshold.');
+      } else if (zeroCount === scores.length) {
+        div('error-box', 'ERROR: All scores are exactly 0. The model may not be running at all.');
+      }
+
+      // Top 20 scores (sorted)
+      const indexed = Array.from(scores).map((v, i) => ({ score: v, idx: i }));
+      indexed.sort((a, b) => b.score - a.score);
+      const top20 = indexed.slice(0, 20);
+
+      const anchors = generateAnchors();
+
+      const topRows = top20.map(({ score, idx }) => {
+        const anchor = anchors[idx];
+        const layer = idx < 512 ? '16x16' : '8x8';
+        const localIdx = idx < 512 ? idx : idx - 512;
+        return [
+          idx.toString(),
+          score.toFixed(6),
+          sigmoid(score).toFixed(6),
+          `(${anchor.x.toFixed(3)}, ${anchor.y.toFixed(3)})`,
+          layer,
+          localIdx.toString(),
+        ];
+      });
+      addTable(['Anchor #', 'Raw Score', 'Sigmoid', 'Anchor (x,y)', 'Layer', 'Local Idx'], topRows);
+
+      // ============ After sigmoid thresholds ============
+      hr_();
+      section('SIGMOID SCORE DISTRIBUTION');
+      const thresholds = [0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9];
+      for (const th of thresholds) {
+        let count = 0;
+        for (let i = 0; i < scores.length; i++) {
+          if (sigmoid(scores[i]) > th) count++;
+        }
+        const cls = count > 0 ? 'ok' : (th <= 0.3 ? 'warn' : 'dim');
+        row(`score > ${th}`, `${count} anchors`, cls);
+      }
+
+      // ============ Raw regressor values for top detections ============
+      hr_();
+      section('RAW REGRESSORS (top 5 detections)');
+      const top5 = indexed.slice(0, 5);
+      for (const { score, idx } of top5) {
+        const anchor = anchors[idx];
+        const base = idx * 16;
+        const regVals = [];
+        for (let v = 0; v < 16; v++) {
+          regVals.push(regressors[base + v]);
+        }
+        const boxStr = regVals.slice(0, 4).map(v => v.toFixed(2)).join(', ');
+        const kpStr = [];
+        for (let k = 0; k < 6; k++) {
+          kpStr.push(`(${regVals[4 + k*2].toFixed(2)}, ${regVals[4 + k*2 + 1].toFixed(2)})`);
+        }
+        row(`Anchor #${idx}`, `raw=${score.toFixed(4)} sig=${sigmoid(score).toFixed(4)}`, 'num');
+        row('  box [cx,cy,w,h]', boxStr, 'dim');
+        row('  keypoints', kpStr.join(' '), 'dim');
+
+        // Decode the box
+        const cx = anchor.x + regVals[0] / 128;
+        const cy = anchor.y + regVals[1] / 128;
+        const w = regVals[2] / 128;
+        const h = regVals[3] / 128;
+        row('  decoded box', `cx=${cx.toFixed(4)} cy=${cy.toFixed(4)} w=${w.toFixed(4)} h=${h.toFixed(4)}`, 'dim');
+      }
+
+      // ============ Regressor statistics ============
+      hr_();
+      section('REGRESSOR STATISTICS');
+      let regMin = Infinity, regMax = -Infinity, regSum = 0, regZero = 0;
+      for (let i = 0; i < regressors.length; i++) {
+        const v = regressors[i];
+        if (v < regMin) regMin = v;
+        if (v > regMax) regMax = v;
+        regSum += v;
+        if (v === 0) regZero++;
+      }
+      row('Min regressor', regMin.toFixed(4), 'num');
+      row('Max regressor', regMax.toFixed(4), 'num');
+      row('Avg regressor', (regSum / regressors.length).toFixed(4), 'num');
+      row('Zero regressors', `${regZero} / ${regressors.length}`, regZero === regressors.length ? 'err' : 'num');
+
+      // ============ Anchor grid visualization ============
+      hr_();
+      section('ANCHOR GRID VISUALIZATION');
+
+      const anchorCanvas = addCanvas(384, 384, 'Anchor centers (blue=16x16 layer, red=8x8 layer) overlaid on letterboxed input');
+      const actx = anchorCanvas.getContext('2d');
+
+      // Draw the image resized to the letterbox area
+      const imgAspect = img.naturalWidth / img.naturalHeight;
+      const canvasSize = 384;
+      const scale = Math.min(128 / img.naturalWidth, 128 / img.naturalHeight);
+      const scaledW = Math.round(img.naturalWidth * scale);
+      const scaledH = Math.round(img.naturalHeight * scale);
+      const offsetX = Math.floor((128 - scaledW) / 2);
+      const offsetY = Math.floor((128 - scaledH) / 2);
+      const drawScale = canvasSize / 128;
+
+      actx.fillStyle = '#000';
+      actx.fillRect(0, 0, canvasSize, canvasSize);
+      actx.drawImage(img,
+        offsetX * drawScale, offsetY * drawScale,
+        scaledW * drawScale, scaledH * drawScale);
+
+      // Draw 16x16 anchors (blue, smaller)
+      actx.fillStyle = 'rgba(96, 165, 250, 0.4)';
+      for (let i = 0; i < 512; i += 2) { // skip duplicates
+        const a = anchors[i];
+        actx.beginPath();
+        actx.arc(a.x * canvasSize, a.y * canvasSize, 2, 0, Math.PI * 2);
+        actx.fill();
+      }
+
+      // Draw 8x8 anchors (red, larger)
+      actx.fillStyle = 'rgba(239, 68, 68, 0.5)';
+      for (let i = 512; i < 896; i += 6) { // skip duplicates
+        const a = anchors[i];
+        actx.beginPath();
+        actx.arc(a.x * canvasSize, a.y * canvasSize, 4, 0, Math.PI * 2);
+        actx.fill();
+      }
+
+      // ============ Score heatmap ============
+      hr_();
+      section('SCORE HEATMAP');
+      div('info-box', 'Showing max sigmoid score at each grid position. Brighter = higher confidence.');
+
+      const heatCanvas = addCanvas(384, 384, 'Score heatmap (16x16 grid, max score per position)');
+      const hctx = heatCanvas.getContext('2d');
+      hctx.fillStyle = '#000';
+      hctx.fillRect(0, 0, 384, 384);
+
+      // Draw image in background (dim)
+      hctx.globalAlpha = 0.3;
+      hctx.drawImage(img,
+        offsetX * drawScale, offsetY * drawScale,
+        scaledW * drawScale, scaledH * drawScale);
+      hctx.globalAlpha = 1.0;
+
+      // 16x16 heatmap
+      const cellSize16 = 384 / 16;
+      for (let y = 0; y < 16; y++) {
+        for (let x = 0; x < 16; x++) {
+          const idx0 = (y * 16 + x) * 2;
+          const s0 = sigmoid(scores[idx0]);
+          const s1 = sigmoid(scores[idx0 + 1]);
+          const maxS = Math.max(s0, s1);
+          if (maxS > 0.01) {
+            const intensity = Math.min(255, Math.floor(maxS * 255 * 3));
+            hctx.fillStyle = `rgba(52, 211, 153, ${Math.min(0.8, maxS * 2)})`;
+            hctx.fillRect(x * cellSize16, y * cellSize16, cellSize16, cellSize16);
+            // Show score text for high values
+            if (maxS > 0.1) {
+              hctx.fillStyle = '#fff';
+              hctx.font = '9px monospace';
+              hctx.fillText(maxS.toFixed(2), x * cellSize16 + 2, y * cellSize16 + 12);
+            }
+          }
+        }
+      }
+
+      // ============ Run detector with very low threshold ============
+      hr_();
+      section('DETECTIONS (threshold=0.01)');
+      const detResult = await detector.detectRawWithResize(bmp, bmp.width, bmp.height);
+      row('Detections found', detResult.detections.length.toString(),
+        detResult.detections.length > 0 ? 'ok' : 'err');
+
+      if (detResult.detections.length > 0) {
+        for (let i = 0; i < Math.min(detResult.detections.length, 5); i++) {
+          const d = detResult.detections[i];
+          row(`Detection #${i}`, `score=${d.score.toFixed(4)}`, 'num');
+          row('  box', `cx=${d.box[0].toFixed(3)} cy=${d.box[1].toFixed(3)} w=${d.box[2].toFixed(3)} h=${d.box[3].toFixed(3)}`, 'dim');
+          row('  keypoints', d.keypoints.map(([x,y]) => `(${x.toFixed(3)},${y.toFixed(3)})`).join(' '), 'dim');
+        }
+
+        // Draw detections on image
+        hr_();
+        section('DETECTION VISUALIZATION');
+
+        // Remove letterbox from detections for visualization
+        const sx = 1 / (1 - 2 * lbPadX);
+        const sy = 1 / (1 - 2 * lbPadY);
+
+        const detCanvas = addCanvas(img.naturalWidth, img.naturalHeight, 'Detections (green=high conf, yellow=low conf)');
+        detCanvas.style.maxWidth = '400px';
+        const dctx = detCanvas.getContext('2d');
+        dctx.drawImage(img, 0, 0);
+
+        for (const d of detResult.detections) {
+          // Remove letterbox
+          const cx = (d.box[0] - lbPadX) * sx * img.naturalWidth;
+          const cy = (d.box[1] - lbPadY) * sy * img.naturalHeight;
+          const w = d.box[2] * sx * img.naturalWidth;
+          const h = d.box[3] * sy * img.naturalHeight;
+
+          const color = d.score > 0.5 ? '#34d399' : (d.score > 0.2 ? '#fbbf24' : '#ef4444');
+          dctx.strokeStyle = color;
+          dctx.lineWidth = 2;
+          dctx.strokeRect(cx - w/2, cy - h/2, w, h);
+
+          // Score label
+          dctx.fillStyle = color;
+          dctx.font = '14px monospace';
+          dctx.fillText(d.score.toFixed(3), cx - w/2, cy - h/2 - 4);
+
+          // Draw keypoints
+          for (const [kx, ky] of d.keypoints) {
+            const pkx = (kx - lbPadX) * sx * img.naturalWidth;
+            const pky = (ky - lbPadY) * sy * img.naturalHeight;
+            dctx.beginPath();
+            dctx.arc(pkx, pky, 3, 0, Math.PI * 2);
+            dctx.fillStyle = '#60a5fa';
+            dctx.fill();
+          }
+        }
+      } else {
+        div('warn-box', `No detections even at threshold 0.01.
+
+DIAGNOSIS:
+- Max raw score (logit): ${maxScore.toFixed(4)} => sigmoid: ${sigmoid(maxScore).toFixed(4)}
+- If max sigmoid < 0.01: The model is producing no confident predictions at all.
+  Likely causes:
+  1. Input normalization: shaders output [0,1] but model expects [-1,1]
+  2. Weight loading error (wrong shapes, wrong byte offsets)
+  3. Shader computation error (wrong convolution, wrong buffer layout)
+
+- If max sigmoid >= 0.01 but 0 detections: NMS is filtering everything.
+  Check if multiple high-scoring overlapping anchors are being suppressed.`);
+      }
+
+      // ============ Score distribution histogram ============
+      hr_();
+      section('SCORE HISTOGRAM (sigmoid)');
+      const buckets = new Array(20).fill(0);
+      for (let i = 0; i < scores.length; i++) {
+        const s = sigmoid(scores[i]);
+        const bucket = Math.min(19, Math.floor(s * 20));
+        buckets[bucket]++;
+      }
+      const maxBucket = Math.max(...buckets);
+      const histCanvas = addCanvas(400, 120, 'Sigmoid score distribution (896 anchors)');
+      const hictx = histCanvas.getContext('2d');
+      hictx.fillStyle = '#111';
+      hictx.fillRect(0, 0, 400, 120);
+      const barW = 400 / 20;
+      for (let i = 0; i < 20; i++) {
+        const barH = maxBucket > 0 ? (buckets[i] / maxBucket) * 100 : 0;
+        hictx.fillStyle = i < 2 ? '#555' : (i < 6 ? '#fbbf24' : (i < 10 ? '#60a5fa' : '#34d399'));
+        hictx.fillRect(i * barW + 1, 110 - barH, barW - 2, barH);
+        // Labels
+        if (i % 5 === 0) {
+          hictx.fillStyle = '#888';
+          hictx.font = '9px monospace';
+          hictx.fillText((i * 5).toString() + '%', i * barW, 118);
+        }
+      }
+      // Count annotation
+      hictx.fillStyle = '#ededed';
+      hictx.font = '10px monospace';
+      hictx.fillText(`[0-5%]: ${buckets[0]}  [5-10%]: ${buckets[1]}  [90-100%]: ${buckets[18] + buckets[19]}`, 5, 10);
+
+      // ============ Final diagnosis ============
+      hr_();
+      section('DIAGNOSIS SUMMARY');
+
+      const maxSigmoid = sigmoid(maxScore);
+      if (maxSigmoid < 0.01) {
+        div('error-box', `LIKELY ROOT CAUSE: Input normalization
+
+The maximum sigmoid score across all 896 anchors is ${maxSigmoid.toFixed(6)} (raw logit: ${maxScore.toFixed(4)}).
+This means no anchor has even 1% confidence that a face exists.
+
+The input shaders (FACE_CANVAS_INPUT_SHADER and FACE_LETTERBOX_RESIZE_SHADER) output
+pixel values in [0, 1] range. BlazeFace was trained on [-1, 1] input range.
+
+Fix: Change the shaders to normalize: output = pixel * 2.0 - 1.0
+
+Specifically in FACE_CANVAS_INPUT_SHADER, change:
+  output[...] = pixel.r;
+to:
+  output[...] = pixel.r * 2.0 - 1.0;
+
+And similarly for FACE_LETTERBOX_RESIZE_SHADER.`);
+      } else if (maxSigmoid < 0.5) {
+        div('warn-box', `POSSIBLE ISSUE: Scores are present but low
+
+Max sigmoid: ${maxSigmoid.toFixed(4)} (raw: ${maxScore.toFixed(4)})
+The model sees something but isn't confident. Could be:
+- Partial normalization issue (range off but not completely wrong)
+- Image quality/content issue
+- Weight precision issue (f32 vs f16 mismatch)`);
+      } else if (detResult.detections.length === 0) {
+        div('warn-box', `POSSIBLE ISSUE: High scores but no detections
+
+Max sigmoid: ${maxSigmoid.toFixed(4)} but 0 detections after decode+NMS.
+Could be:
+- NMS threshold too aggressive
+- Box decoding producing degenerate boxes
+- Anchor-to-score mapping incorrect (CHW/HWC reorder bug)`);
+      } else {
+        div('info-box', `Detector is working. Found ${detResult.detections.length} detection(s) at threshold 0.01.
+Top score: ${detResult.detections[0].score.toFixed(4)}`);
+      }
+
+      row('Done', (performance.now() - t0).toFixed(0) + 'ms total', 'ok');
+    }
+
+    run().catch(e => {
+      div('error-box', `Fatal: ${e.message}\n\n${e.stack}`);
+    });
+  </script>
+</body>
+</html>

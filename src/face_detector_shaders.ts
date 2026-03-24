@@ -239,9 +239,9 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   if(x>=params.in_width||y>=params.in_height){return;}
   let pixel=textureLoad(input_tex,vec2<u32>(x,y),0);
   let out_stride=params.out_size*params.out_size;
-  output[0u*out_stride+y*params.out_size+x]=pixel.r;
-  output[1u*out_stride+y*params.out_size+x]=pixel.g;
-  output[2u*out_stride+y*params.out_size+x]=pixel.b;
+  output[0u*out_stride+y*params.out_size+x]=pixel.r*2.0-1.0;
+  output[1u*out_stride+y*params.out_size+x]=pixel.g*2.0-1.0;
+  output[2u*out_stride+y*params.out_size+x]=pixel.b*2.0-1.0;
 }
 `);
 
@@ -298,9 +298,9 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   let v = (src_y + 0.5) / f32(params.src_h);
   let pixel = textureSampleLevel(input_tex, input_sampler, vec2<f32>(u, v), 0.0);
 
-  output[0u*out_stride+dy*params.dst_size+dx]=pixel.r;
-  output[1u*out_stride+dy*params.dst_size+dx]=pixel.g;
-  output[2u*out_stride+dy*params.dst_size+dx]=pixel.b;
+  output[0u*out_stride+dy*params.dst_size+dx]=pixel.r*2.0-1.0;
+  output[1u*out_stride+dy*params.dst_size+dx]=pixel.g*2.0-1.0;
+  output[2u*out_stride+dy*params.dst_size+dx]=pixel.b*2.0-1.0;
 }
 `);
 

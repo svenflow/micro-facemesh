@@ -76,7 +76,8 @@
       const initT0 = performance.now();
       const facemesh = await createFacemesh({
         weightsUrl: './weights',
-        scoreThreshold: 0.5,
+        scoreThreshold: 0.3,
+        faceScoreThreshold: 0.3,
       });
       const initMs = (performance.now() - initT0).toFixed(0);
       row('Init', initMs + 'ms', 'num');
