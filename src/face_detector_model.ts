@@ -231,8 +231,8 @@ export async function compileFaceDetectorModel(
   // ============ Load and upload weights ============
 
   // Initial conv: 5x5 stride-2, 3->24 channels
-  const initConvW = findWeight('conv2d/Conv2D');
-  const initConvB = findWeight('batch_normalization/', 'conv2d/Conv2D');
+  const initConvW = getWeight('conv2d/Kernel');
+  const initConvB = getWeight('conv2d/Bias');
   const initConvWeightBuf = uploadWeights(initConvW);
   const initConvBiasBuf = uploadWeights(initConvB);
 
@@ -243,54 +243,55 @@ export async function compileFaceDetectorModel(
   // Channel progression: 24->24->28->32->36->42->48->56->64->72->80->88->96
   // Downsampling at blocks 2 (64->32), 5 (32->16), 11 (16->8)
   //
-  // Weight naming: depthwise_conv2d_N, conv2d_N+1, batch_normalization_N+1
+  // Weight naming: depthwise_conv2d_N/Kernel, conv2d_(N+1)/Kernel, conv2d_(N+1)/Bias
+  // (BN is folded into the conv bias, so no separate batch_normalization weights)
 
   const blockDefs: Array<{
     dwKey: string;
     pwKey: string;
-    bnKey: string;
+    biasKey: string;
     inCh: number;
     outCh: number;
     stride: 1 | 2;
     inH: number;
   }> = [
     // Block 0: 24->24, stride 1, 64x64
-    { dwKey: 'depthwise_conv2d/', pwKey: 'conv2d_1/', bnKey: 'batch_normalization_1/', inCh: 24, outCh: 24, stride: 1, inH: 64 },
+    { dwKey: 'depthwise_conv2d/Kernel', pwKey: 'conv2d_1/Kernel', biasKey: 'conv2d_1/Bias', inCh: 24, outCh: 24, stride: 1, inH: 64 },
     // Block 1: 24->28, stride 1, 64x64
-    { dwKey: 'depthwise_conv2d_1/', pwKey: 'conv2d_2/', bnKey: 'batch_normalization_2/', inCh: 24, outCh: 28, stride: 1, inH: 64 },
+    { dwKey: 'depthwise_conv2d_1/Kernel', pwKey: 'conv2d_2/Kernel', biasKey: 'conv2d_2/Bias', inCh: 24, outCh: 28, stride: 1, inH: 64 },
     // Block 2: 28->32, stride 2, 64->32
-    { dwKey: 'depthwise_conv2d_2/', pwKey: 'conv2d_3/', bnKey: 'batch_normalization_3/', inCh: 28, outCh: 32, stride: 2, inH: 64 },
+    { dwKey: 'depthwise_conv2d_2/Kernel', pwKey: 'conv2d_3/Kernel', biasKey: 'conv2d_3/Bias', inCh: 28, outCh: 32, stride: 2, inH: 64 },
     // Block 3: 32->36, stride 1, 32x32
-    { dwKey: 'depthwise_conv2d_3/', pwKey: 'conv2d_4/', bnKey: 'batch_normalization_4/', inCh: 32, outCh: 36, stride: 1, inH: 32 },
+    { dwKey: 'depthwise_conv2d_3/Kernel', pwKey: 'conv2d_4/Kernel', biasKey: 'conv2d_4/Bias', inCh: 32, outCh: 36, stride: 1, inH: 32 },
     // Block 4: 36->42, stride 1, 32x32
-    { dwKey: 'depthwise_conv2d_4/', pwKey: 'conv2d_5/', bnKey: 'batch_normalization_5/', inCh: 36, outCh: 42, stride: 1, inH: 32 },
+    { dwKey: 'depthwise_conv2d_4/Kernel', pwKey: 'conv2d_5/Kernel', biasKey: 'conv2d_5/Bias', inCh: 36, outCh: 42, stride: 1, inH: 32 },
     // Block 5: 42->48, stride 2, 32->16
-    { dwKey: 'depthwise_conv2d_5/', pwKey: 'conv2d_6/', bnKey: 'batch_normalization_6/', inCh: 42, outCh: 48, stride: 2, inH: 32 },
+    { dwKey: 'depthwise_conv2d_5/Kernel', pwKey: 'conv2d_6/Kernel', biasKey: 'conv2d_6/Bias', inCh: 42, outCh: 48, stride: 2, inH: 32 },
     // Block 6: 48->56, stride 1, 16x16
-    { dwKey: 'depthwise_conv2d_6/', pwKey: 'conv2d_7/', bnKey: 'batch_normalization_7/', inCh: 48, outCh: 56, stride: 1, inH: 16 },
+    { dwKey: 'depthwise_conv2d_6/Kernel', pwKey: 'conv2d_7/Kernel', biasKey: 'conv2d_7/Bias', inCh: 48, outCh: 56, stride: 1, inH: 16 },
     // Block 7: 56->64, stride 1, 16x16
-    { dwKey: 'depthwise_conv2d_7/', pwKey: 'conv2d_8/', bnKey: 'batch_normalization_8/', inCh: 56, outCh: 64, stride: 1, inH: 16 },
+    { dwKey: 'depthwise_conv2d_7/Kernel', pwKey: 'conv2d_8/Kernel', biasKey: 'conv2d_8/Bias', inCh: 56, outCh: 64, stride: 1, inH: 16 },
     // Block 8: 64->72, stride 1, 16x16
-    { dwKey: 'depthwise_conv2d_8/', pwKey: 'conv2d_9/', bnKey: 'batch_normalization_9/', inCh: 64, outCh: 72, stride: 1, inH: 16 },
+    { dwKey: 'depthwise_conv2d_8/Kernel', pwKey: 'conv2d_9/Kernel', biasKey: 'conv2d_9/Bias', inCh: 64, outCh: 72, stride: 1, inH: 16 },
     // Block 9: 72->80, stride 1, 16x16
-    { dwKey: 'depthwise_conv2d_9/', pwKey: 'conv2d_10/', bnKey: 'batch_normalization_10/', inCh: 72, outCh: 80, stride: 1, inH: 16 },
+    { dwKey: 'depthwise_conv2d_9/Kernel', pwKey: 'conv2d_10/Kernel', biasKey: 'conv2d_10/Bias', inCh: 72, outCh: 80, stride: 1, inH: 16 },
     // Block 10: 80->88, stride 1, 16x16 -> SSD head 1
-    { dwKey: 'depthwise_conv2d_10/', pwKey: 'conv2d_11/', bnKey: 'batch_normalization_11/', inCh: 80, outCh: 88, stride: 1, inH: 16 },
+    { dwKey: 'depthwise_conv2d_10/Kernel', pwKey: 'conv2d_11/Kernel', biasKey: 'conv2d_11/Bias', inCh: 80, outCh: 88, stride: 1, inH: 16 },
     // Block 11: 88->96, stride 2, 16->8 -> SSD head 2
-    { dwKey: 'depthwise_conv2d_11/', pwKey: 'conv2d_12/', bnKey: 'batch_normalization_12/', inCh: 88, outCh: 96, stride: 2, inH: 16 },
+    { dwKey: 'depthwise_conv2d_11/Kernel', pwKey: 'conv2d_12/Kernel', biasKey: 'conv2d_12/Bias', inCh: 88, outCh: 96, stride: 2, inH: 16 },
   ];
 
   const blocks: BackboneBlock[] = blockDefs.map(def => {
-    const dwTensor = findWeight(def.dwKey);
-    const pwTensor = findWeight(def.pwKey);
-    const bnTensor = findWeight(def.bnKey);
+    const dwTensor = getWeight(def.dwKey);
+    const pwTensor = getWeight(def.pwKey);
+    const biasTensor = getWeight(def.biasKey);
 
     // Transpose DW weights from [1,3,3,ch] to [ch, 9]
     const dwTransposed = transposeDW3x3(dwTensor);
     const dwBuf = makeBuf(dwTransposed.byteLength, SC);
     writeBuf(dwBuf, 0, dwTransposed);
 
-    // Zero bias for DW (bias is folded into weights in TFLite export)
+    // Zero bias for DW (bias is folded into PW conv bias)
     const dwBias = new Float32Array(def.inCh);
     const dwBiasBuf = makeBuf(dwBias.byteLength, SC);
     writeBuf(dwBiasBuf, 0, dwBias);
@@ -300,8 +301,8 @@ export async function compileFaceDetectorModel(
     const pwBuf = makeBuf(pwTransposed.byteLength, SC);
     writeBuf(pwBuf, 0, pwTransposed);
 
-    // PW bias from fused batchnorm
-    const pwBiasBuf = uploadWeights(bnTensor);
+    // PW bias (BN folded into conv bias)
+    const pwBiasBuf = uploadWeights(biasTensor);
 
     return {
       dwWeightBuf: dwBuf,
@@ -317,26 +318,26 @@ export async function compileFaceDetectorModel(
 
   // ============ SSD Head weights ============
   // 16x16 head (2 anchors per cell): after block 10 (88ch output)
-  const cls16W = transposePW(findWeight('classificator_8', 'Conv2D'));
+  const cls16W = transposePW(getWeight('classificator_8/Kernel'));
   const cls16WBuf = makeBuf(cls16W.byteLength, SC);
   writeBuf(cls16WBuf, 0, cls16W);
-  const cls16BBuf = uploadWeights(findWeight('classificator_8', 'BiasAdd'));
+  const cls16BBuf = uploadWeights(getWeight('classificator_8/Bias'));
 
-  const reg16W = transposePW(findWeight('regressor_8', 'Conv2D'));
+  const reg16W = transposePW(getWeight('regressor_8/Kernel'));
   const reg16WBuf = makeBuf(reg16W.byteLength, SC);
   writeBuf(reg16WBuf, 0, reg16W);
-  const reg16BBuf = uploadWeights(findWeight('regressor_8', 'BiasAdd'));
+  const reg16BBuf = uploadWeights(getWeight('regressor_8/Bias'));
 
   // 8x8 head (6 anchors per cell): after block 11 (96ch output)
-  const cls8W = transposePW(findWeight('classificator_16', 'Conv2D'));
+  const cls8W = transposePW(getWeight('classificator_16/Kernel'));
   const cls8WBuf = makeBuf(cls8W.byteLength, SC);
   writeBuf(cls8WBuf, 0, cls8W);
-  const cls8BBuf = uploadWeights(findWeight('classificator_16', 'BiasAdd'));
+  const cls8BBuf = uploadWeights(getWeight('classificator_16/Bias'));
 
-  const reg8W = transposePW(findWeight('regressor_16', 'Conv2D'));
+  const reg8W = transposePW(getWeight('regressor_16/Kernel'));
   const reg8WBuf = makeBuf(reg8W.byteLength, SC);
   writeBuf(reg8WBuf, 0, reg8W);
-  const reg8BBuf = uploadWeights(findWeight('regressor_16', 'BiasAdd'));
+  const reg8BBuf = uploadWeights(getWeight('regressor_16/Bias'));
 
   // ============ Activation buffers ============
   // Max buffer size needed across all layers
