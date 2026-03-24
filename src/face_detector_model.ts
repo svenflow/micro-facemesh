@@ -13,12 +13,15 @@
  *    Block 4:  36->42, stride 1, 32x32
  *    Block 5:  42->48, stride 2, 32->16  (stride-2 transition)
  *    Block 6:  48->56, stride 1, 16x16
- *    Block 7:  56->64, stride 1, 16x16   [SSD head 1: 16x16, 88ch after block 8]
+ *    Block 7:  56->64, stride 1, 16x16
  *    Block 8:  64->72, stride 1, 16x16
  *    Block 9:  72->80, stride 1, 16x16
  *    Block 10: 80->88, stride 1, 16x16   -> 16x16 SSD head (88ch, 2 anchors)
  *    Block 11: 88->96, stride 2, 16->8   (stride-2 transition)
- *    -> 8x8 SSD head (96ch, 6 anchors)
+ *    Block 12: 96->96, stride 1, 8x8
+ *    Block 13: 96->96, stride 1, 8x8
+ *    Block 14: 96->96, stride 1, 8x8
+ *    Block 15: 96->96, stride 1, 8x8     -> 8x8 SSD head (96ch, 6 anchors)
  *
  * SSD outputs:
  *   16x16: 2 classifiers + 32 regressors (2 anchors x 16 values) = 512 anchors
@@ -240,7 +243,7 @@ export async function compileFaceDetectorModel(
   // BlazeFace short-range backbone: 12 BlazeBlocks
   // Each block: DW 3x3 + PW 1x1 + channel-pad residual + ReLU
   //
-  // Channel progression: 24->24->28->32->36->42->48->56->64->72->80->88->96
+  // Channel progression: 24->24->28->32->36->42->48->56->64->72->80->88->96->96->96->96->96
   // Downsampling at blocks 2 (64->32), 5 (32->16), 11 (16->8)
   //
   // Weight naming: depthwise_conv2d_N/Kernel, conv2d_(N+1)/Kernel, conv2d_(N+1)/Bias
@@ -277,8 +280,16 @@ export async function compileFaceDetectorModel(
     { dwKey: 'depthwise_conv2d_9/Kernel', pwKey: 'conv2d_10/Kernel', biasKey: 'conv2d_10/Bias', inCh: 72, outCh: 80, stride: 1, inH: 16 },
     // Block 10: 80->88, stride 1, 16x16 -> SSD head 1
     { dwKey: 'depthwise_conv2d_10/Kernel', pwKey: 'conv2d_11/Kernel', biasKey: 'conv2d_11/Bias', inCh: 80, outCh: 88, stride: 1, inH: 16 },
-    // Block 11: 88->96, stride 2, 16->8 -> SSD head 2
+    // Block 11: 88->96, stride 2, 16->8
     { dwKey: 'depthwise_conv2d_11/Kernel', pwKey: 'conv2d_12/Kernel', biasKey: 'conv2d_12/Bias', inCh: 88, outCh: 96, stride: 2, inH: 16 },
+    // Block 12: 96->96, stride 1, 8x8
+    { dwKey: 'depthwise_conv2d_12/Kernel', pwKey: 'conv2d_13/Kernel', biasKey: 'conv2d_13/Bias', inCh: 96, outCh: 96, stride: 1, inH: 8 },
+    // Block 13: 96->96, stride 1, 8x8
+    { dwKey: 'depthwise_conv2d_13/Kernel', pwKey: 'conv2d_14/Kernel', biasKey: 'conv2d_14/Bias', inCh: 96, outCh: 96, stride: 1, inH: 8 },
+    // Block 14: 96->96, stride 1, 8x8
+    { dwKey: 'depthwise_conv2d_14/Kernel', pwKey: 'conv2d_15/Kernel', biasKey: 'conv2d_15/Bias', inCh: 96, outCh: 96, stride: 1, inH: 8 },
+    // Block 15: 96->96, stride 1, 8x8 -> SSD head 2
+    { dwKey: 'depthwise_conv2d_15/Kernel', pwKey: 'conv2d_16/Kernel', biasKey: 'conv2d_16/Bias', inCh: 96, outCh: 96, stride: 1, inH: 8 },
   ];
 
   const blocks: BackboneBlock[] = blockDefs.map(def => {
@@ -362,11 +373,17 @@ export async function compileFaceDetectorModel(
   const cls8Buf = makeBuf(8 * 8 * 6 * 4, SOC);
   const reg8Buf = makeBuf(8 * 8 * 96 * 4, SOC);
 
-  // Readback buffers
-  const cls16ReadBuf = makeBuf(16 * 16 * 2 * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
-  const reg16ReadBuf = makeBuf(16 * 16 * 32 * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
-  const cls8ReadBuf = makeBuf(8 * 8 * 6 * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
-  const reg8ReadBuf = makeBuf(8 * 8 * 96 * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+  // Single consolidated readback buffer (1 mapAsync instead of 4)
+  const CLS16_SIZE = 16 * 16 * 2 * 4;
+  const REG16_SIZE = 16 * 16 * 32 * 4;
+  const CLS8_SIZE = 8 * 8 * 6 * 4;
+  const REG8_SIZE = 8 * 8 * 96 * 4;
+  const CLS16_OFF = 0;
+  const REG16_OFF = CLS16_SIZE;
+  const CLS8_OFF = REG16_OFF + REG16_SIZE;
+  const REG8_OFF = CLS8_OFF + CLS8_SIZE;
+  const TOTAL_READBACK = REG8_OFF + REG8_SIZE;
+  const readbackBuf = makeBuf(TOTAL_READBACK, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
 
   // Canvas input texture
   const canvasInputTexture = device.createTexture({
@@ -576,6 +593,7 @@ export async function compileFaceDetectorModel(
       if (i === 10) {
         ssd16SourceBuf = curBuf;
       }
+      // Note: 8x8 SSD head uses curBuf after block 15 (last block)
     }
 
     // After block 11: curBuf has 8x8x96
@@ -593,34 +611,21 @@ export async function compileFaceDetectorModel(
     encodeConv1x1(encoder, curBuf, reg8WBuf, reg8BBuf, reg8Buf, ssdReg8Uniform, 96, 8, 8);
     encodeQuantizeF16(encoder, reg8Buf, 8 * 8 * 96);
 
-    // Submit compute passes
+    // Copy all SSD outputs to single readback buffer (1 mapAsync instead of 4)
+    encoder.copyBufferToBuffer(cls16Buf, 0, readbackBuf, CLS16_OFF, CLS16_SIZE);
+    encoder.copyBufferToBuffer(reg16Buf, 0, readbackBuf, REG16_OFF, REG16_SIZE);
+    encoder.copyBufferToBuffer(cls8Buf, 0, readbackBuf, CLS8_OFF, CLS8_SIZE);
+    encoder.copyBufferToBuffer(reg8Buf, 0, readbackBuf, REG8_OFF, REG8_SIZE);
     device.queue.submit([encoder.finish()]);
 
-    // Copy outputs to readback buffers
-    const copyEncoder = device.createCommandEncoder();
-    copyEncoder.copyBufferToBuffer(cls16Buf, 0, cls16ReadBuf, 0, 16 * 16 * 2 * 4);
-    copyEncoder.copyBufferToBuffer(reg16Buf, 0, reg16ReadBuf, 0, 16 * 16 * 32 * 4);
-    copyEncoder.copyBufferToBuffer(cls8Buf, 0, cls8ReadBuf, 0, 8 * 8 * 6 * 4);
-    copyEncoder.copyBufferToBuffer(reg8Buf, 0, reg8ReadBuf, 0, 8 * 8 * 96 * 4);
-    device.queue.submit([copyEncoder.finish()]);
-
-    // Wait and read back
-    await Promise.all([
-      cls16ReadBuf.mapAsync(GPUMapMode.READ),
-      reg16ReadBuf.mapAsync(GPUMapMode.READ),
-      cls8ReadBuf.mapAsync(GPUMapMode.READ),
-      reg8ReadBuf.mapAsync(GPUMapMode.READ),
-    ]);
-
-    const cls16Data = new Float32Array(cls16ReadBuf.getMappedRange()).slice();
-    const reg16Data = new Float32Array(reg16ReadBuf.getMappedRange()).slice();
-    const cls8Data = new Float32Array(cls8ReadBuf.getMappedRange()).slice();
-    const reg8Data = new Float32Array(reg8ReadBuf.getMappedRange()).slice();
-
-    cls16ReadBuf.unmap();
-    reg16ReadBuf.unmap();
-    cls8ReadBuf.unmap();
-    reg8ReadBuf.unmap();
+    // Single mapAsync for all SSD outputs
+    await readbackBuf.mapAsync(GPUMapMode.READ);
+    const mapped = readbackBuf.getMappedRange();
+    const cls16Data = new Float32Array(mapped, CLS16_OFF, CLS16_SIZE / 4).slice();
+    const reg16Data = new Float32Array(mapped, REG16_OFF, REG16_SIZE / 4).slice();
+    const cls8Data = new Float32Array(mapped, CLS8_OFF, CLS8_SIZE / 4).slice();
+    const reg8Data = new Float32Array(mapped, REG8_OFF, REG8_SIZE / 4).slice();
+    readbackBuf.unmap();
 
     // Combine outputs: reorder from CHW (GPU) to HWC (SSD anchor ordering)
     // 16x16 grid, 2 anchors per cell: cls is [2, 16, 16], reg is [32, 16, 16]

@@ -322,22 +322,18 @@ export async function createFacemesh(options: FacemeshOptions = {}): Promise<Fac
     return 1 / (1 + Math.exp(-x));
   }
 
-  /**
-   * Run landmark inference for a single ROI. Shared between detection and tracking paths.
-   * Returns landmarks + score, or null if face presence score is below threshold.
-   */
-  async function runLandmarkForROI(
+  // ---- Shared helpers for landmark processing ----
+
+  /** Encode crop + landmark inference into an encoder (no submit). */
+  function encodeCropAndLandmark(
     pxROI: { centerXpx: number; centerYpx: number; sizePx: number; rotation: number },
-    srcTexture: GPUTexture,
-    srcWidth: number, srcHeight: number,
+    srcTexture: GPUTexture, srcWidth: number, srcHeight: number,
     cropPipeline: CropPipeline, cropOutputBuf: GPUBuffer,
-    isTracking = false,
-  ): Promise<{ landmarks: Landmark[]; score: number } | null> {
-    // Compute affine transform: crop pixel → source normalized [0,1]
+    encoder: GPUCommandEncoder,
+  ): void {
     const cosR = Math.cos(pxROI.rotation);
     const sinR = Math.sin(pxROI.rotation);
     const s = pxROI.sizePx / LANDMARK_SIZE;
-
     const halfLM = LANDMARK_SIZE / 2;
     const a = cosR * s / srcWidth;
     const b = -sinR * s / srcWidth;
@@ -346,75 +342,168 @@ export async function createFacemesh(options: FacemeshOptions = {}): Promise<Fac
     const d = cosR * s / srcHeight;
     const ty = pxROI.centerYpx / srcHeight - halfLM * (c + d);
 
-    const encoder = cropDevice.createCommandEncoder();
     cropPipeline.crop(
       encoder, srcTexture, cropOutputBuf,
       [a, b, tx, c, d, ty],
       srcWidth, srcHeight, LANDMARK_SIZE,
     );
-    cropDevice.queue.submit([encoder.finish()]);
+    landmarkModel.encodeFromGPUBuffer(cropOutputBuf, encoder);
+  }
 
-    // Run landmark model on the cropped face
-    const output: FaceLandmarksOutput = await landmarkModel.runFromGPUBuffer(cropOutputBuf);
-    const presenceScore = sigmoid(output.facePresence[0]!);
-
-    // Use a lower threshold for tracking frames to avoid dropping tracked faces
-    // unnecessarily. Face detection will re-acquire if truly lost.
-    const effectiveThreshold = isTracking ? Math.min(scoreThreshold, 0.1) : scoreThreshold;
-    if (presenceScore < effectiveThreshold) return null;
-
-    // Convert 478 landmarks from crop space to original image coordinates
+  /** Convert raw landmark output to Landmark[] in original image coords. */
+  function convertLandmarks(
+    output: FaceLandmarksOutput,
+    pxROI: { centerXpx: number; centerYpx: number; sizePx: number; rotation: number },
+    srcWidth: number, srcHeight: number,
+  ): Landmark[] {
+    const cosR = Math.cos(pxROI.rotation);
+    const sinR = Math.sin(pxROI.rotation);
     const landmarks: Landmark[] = [];
     for (let i = 0; i < NUM_LANDMARKS; i++) {
       const lx = output.landmarks[i * 3]!;
       const ly = output.landmarks[i * 3 + 1]!;
       const lz = output.landmarks[i * 3 + 2]!;
-
-      // Transform from crop-normalized [0,1] to pixel offset from center
       const dx = (lx - 0.5) * pxROI.sizePx;
       const dy = (ly - 0.5) * pxROI.sizePx;
-
-      // Rotate back to original image space
       const origXpx = cosR * dx - sinR * dy + pxROI.centerXpx;
       const origYpx = sinR * dx + cosR * dy + pxROI.centerYpx;
-
-      landmarks.push({
-        x: origXpx / srcWidth,
-        y: origYpx / srcHeight,
-        z: lz,
-      });
+      landmarks.push({ x: origXpx / srcWidth, y: origYpx / srcHeight, z: lz });
     }
+    return landmarks;
+  }
 
-    return { landmarks, score: presenceScore };
+  /** Build FacemeshResult from landmarks + score. */
+  function buildResult(landmarks: Landmark[], score: number): FacemeshResult {
+    const detectorLandmarkIndices = [133, 362, 1, 13, 234, 454];
+    const faceKps = detectorLandmarkIndices.map(idx => landmarks[idx]!);
+    return { score, landmarks, keypoints: toFaceKeypoints(faceKps) };
+  }
+
+  /**
+   * Run landmark inference for a single ROI (synchronous path).
+   * Used by detection path and first tracking frame.
+   */
+  async function runLandmarkForROI(
+    pxROI: { centerXpx: number; centerYpx: number; sizePx: number; rotation: number },
+    srcTexture: GPUTexture,
+    srcWidth: number, srcHeight: number,
+    cropPipeline: CropPipeline, cropOutputBuf: GPUBuffer,
+    isTracking = false,
+  ): Promise<{ landmarks: Landmark[]; score: number } | null> {
+    const encoder = cropDevice.createCommandEncoder();
+    encodeCropAndLandmark(pxROI, srcTexture, srcWidth, srcHeight, cropPipeline, cropOutputBuf, encoder);
+    cropDevice.queue.submit([encoder.finish()]);
+
+    const output: FaceLandmarksOutput = await landmarkModel.readbackLandmarks();
+    const presenceScore = output.facePresence[0]!;
+
+    const effectiveThreshold = isTracking ? Math.min(scoreThreshold, 0.1) : scoreThreshold;
+    if (presenceScore < effectiveThreshold) return null;
+
+    return { landmarks: convertLandmarks(output, pxROI, srcWidth, srcHeight), score: presenceScore };
+  }
+
+  // ---- Double-buffered pipeline state (persists across detect() calls) ----
+  // When pipelined, GPU processes current frame while we return previous frame's results.
+  // This hides the mapAsync latency (~3-5ms on mobile) behind the inter-frame gap.
+  let pipelinedReadback: Promise<FaceLandmarksOutput> | null = null;
+  let pipelinedROI: { centerXpx: number; centerYpx: number; sizePx: number; rotation: number } | null = null;
+  let pipelinedSrcDims: [number, number] | null = null;
+  let pipelinedResults: FacemeshResult[] | null = null; // cached results from previous frame
+
+  /** Reset pipeline state (on tracking loss or detection). */
+  function resetPipeline(): void {
+    pipelinedReadback = null;
+    pipelinedROI = null;
+    pipelinedSrcDims = null;
+    pipelinedResults = null;
   }
 
   async function detect(source: FacemeshInput): Promise<FacemeshResult[]> {
-    // Get source dimensions and prepare upload source.
-    // HTMLVideoElement and HTMLImageElement can be passed directly to
-    // copyExternalImageToTexture — the browser handles orientation internally.
-    // Only fall back to createImageBitmap for ImageData (which can't be copied directly).
+    // Get source dimensions. For video/image elements, start createImageBitmap
+    // as a promise (don't await yet) so it can overlap with pipelined readback.
+    // iOS Safari WebGPU requires ImageBitmap for copyExternalImageToTexture.
     let srcWidth: number;
     let srcHeight: number;
-    let uploadSource: HTMLCanvasElement | OffscreenCanvas | ImageBitmap | HTMLVideoElement | HTMLImageElement;
+    let uploadSourceOrPromise: HTMLCanvasElement | OffscreenCanvas | ImageBitmap | Promise<ImageBitmap>;
 
     if (source instanceof HTMLVideoElement) {
       srcWidth = source.videoWidth;
       srcHeight = source.videoHeight;
-      uploadSource = source;
+      // Start bitmap creation NOW — will overlap with readback await below
+      uploadSourceOrPromise = createImageBitmap(source, { colorSpaceConversion: 'none' });
     } else if (source instanceof HTMLImageElement) {
       srcWidth = source.naturalWidth;
       srcHeight = source.naturalHeight;
-      uploadSource = source;
+      uploadSourceOrPromise = createImageBitmap(source, { colorSpaceConversion: 'none' });
     } else if (source instanceof ImageData) {
-      const bmp = await createImageBitmap(source, { colorSpaceConversion: 'none' });
-      [srcWidth, srcHeight] = [bmp.width, bmp.height];
-      uploadSource = bmp;
+      uploadSourceOrPromise = createImageBitmap(source, { colorSpaceConversion: 'none' });
+      // Need dimensions from source directly
+      srcWidth = source.width;
+      srcHeight = source.height;
     } else {
       [srcWidth, srcHeight] = getSourceDimensions(source);
-      uploadSource = source as HTMLCanvasElement | OffscreenCanvas | ImageBitmap;
+      uploadSourceOrPromise = source as HTMLCanvasElement | OffscreenCanvas | ImageBitmap;
     }
 
-    // Upload source to GPU texture (shared by both tracking and detection paths)
+    // ---- PIPELINED TRACKING PATH ----
+    // If we have a pending readback from the previous frame, await it (should be
+    // near-instant since GPU had the full inter-frame gap to finish), process
+    // previous results, and submit current frame's work non-blocking.
+    // Key: createImageBitmap runs in parallel with this readback await!
+    if (trackedFaces.length > 0 && pipelinedReadback) {
+      const prevOutput = await pipelinedReadback;
+      pipelinedReadback = null;
+
+      const prevROI = pipelinedROI!;
+      const [prevW, prevH] = pipelinedSrcDims!;
+      const presenceScore = prevOutput.facePresence[0]!;
+      const effectiveThreshold = Math.min(scoreThreshold, 0.1);
+
+      if (presenceScore >= effectiveThreshold) {
+        // Previous frame succeeded — process its landmarks
+        const prevLandmarks = convertLandmarks(prevOutput, prevROI, prevW, prevH);
+        const result = buildResult(prevLandmarks, presenceScore);
+
+        // Now await the bitmap (should be ready or nearly ready — ran in parallel)
+        const uploadSource = uploadSourceOrPromise instanceof Promise
+          ? await uploadSourceOrPromise : uploadSourceOrPromise;
+
+        // Upload and submit CURRENT frame's work
+        const cropPipeline = ensureCropPipeline();
+        const cropOutputBuf = ensureCropOutputBuffer();
+        const srcTexture = ensureCropSourceTexture(srcWidth, srcHeight);
+        cropDevice.queue.copyExternalImageToTexture(
+          { source: uploadSource }, { texture: srcTexture }, [srcWidth, srcHeight],
+        );
+
+        const pxROI = landmarksToROI(prevLandmarks, srcWidth, srcHeight);
+        landmarkModel.flipReadbackBuffer();
+        const encoder = cropDevice.createCommandEncoder();
+        encodeCropAndLandmark(pxROI, srcTexture, srcWidth, srcHeight, cropPipeline, cropOutputBuf, encoder);
+        cropDevice.queue.submit([encoder.finish()]);
+
+        // Start non-blocking readback for current frame
+        pipelinedReadback = landmarkModel.beginReadbackLandmarks();
+        pipelinedROI = pxROI;
+        pipelinedSrcDims = [srcWidth, srcHeight];
+        pipelinedResults = [result];
+
+        // Update tracking with previous frame's landmarks
+        trackedFaces = [{ landmarks: prevLandmarks }];
+        return [result];
+      }
+
+      // Tracking lost on previous frame — reset and fall through to detection
+      resetPipeline();
+      trackedFaces = [];
+    }
+
+    // For non-pipelined paths, resolve the bitmap now
+    const uploadSource = uploadSourceOrPromise instanceof Promise
+      ? await uploadSourceOrPromise : uploadSourceOrPromise;
+
+    // Upload source to GPU texture (shared by tracking bootstrap and detection paths)
     const cropPipeline = ensureCropPipeline();
     const cropOutputBuf = ensureCropOutputBuffer();
     const srcTexture = ensureCropSourceTexture(srcWidth, srcHeight);
@@ -424,48 +513,50 @@ export async function createFacemesh(options: FacemeshOptions = {}): Promise<Fac
       [srcWidth, srcHeight],
     );
 
-    // ---- TRACKING PATH ----
-    // If we have previous landmarks, try to track using landmark-derived ROI
-    // (skip face detection — matches MediaPipe's approach for smooth, fast tracking)
-    if (trackedFaces.length > 0) {
-      const results: FacemeshResult[] = [];
+    // ---- BOOTSTRAP TRACKING (first tracking frame) ----
+    // Submit work and start non-blocking readback. Return cached results
+    // from the detection/previous frame (1 frame of latency to start pipeline).
+    if (trackedFaces.length > 0 && !pipelinedReadback) {
+      const tracked = trackedFaces[0]!;
+      const pxROI = landmarksToROI(tracked.landmarks, srcWidth, srcHeight);
 
-      for (const tracked of trackedFaces) {
-        // Compute ROI from previous landmarks (MediaPipe's landmark-to-ROI path)
-        const pxROI = landmarksToROI(tracked.landmarks, srcWidth, srcHeight);
+      landmarkModel.flipReadbackBuffer();
+      const encoder = cropDevice.createCommandEncoder();
+      encodeCropAndLandmark(pxROI, srcTexture, srcWidth, srcHeight, cropPipeline, cropOutputBuf, encoder);
+      cropDevice.queue.submit([encoder.finish()]);
 
-        const result = await runLandmarkForROI(
-          pxROI, srcTexture, srcWidth, srcHeight, cropPipeline, cropOutputBuf, true,
-        );
+      // Start non-blocking readback — will be awaited on NEXT detect() call
+      pipelinedReadback = landmarkModel.beginReadbackLandmarks();
+      pipelinedROI = pxROI;
+      pipelinedSrcDims = [srcWidth, srcHeight];
 
-        if (result) {
-          // Use first 6 keypoints from landmarks corresponding to detector keypoints:
-          // rightEye(0→lm133), leftEye(1→lm362), noseTip(2→lm1),
-          // mouthCenter(3→lm13), rightEarTragion(4→lm234), leftEarTragion(5→lm454)
-          const detectorLandmarkIndices = [133, 362, 1, 13, 234, 454];
-          const faceKps = detectorLandmarkIndices.map(idx => result.landmarks[idx]!);
-
-          results.push({
-            score: result.score,
-            landmarks: result.landmarks,
-            keypoints: toFaceKeypoints(faceKps),
-          });
-        }
-        // If face presence < threshold, this tracked face is lost — don't add to results
+      // Return previous frame's cached results (detection results or last tracking results)
+      if (pipelinedResults) {
+        return pipelinedResults;
       }
 
-      if (results.length > 0) {
-        // Tracking succeeded — update tracked faces for next frame
-        trackedFaces = results.map(r => ({ landmarks: r.landmarks }));
-        return results;
+      // No cached results yet (first frame after detection) — await synchronously
+      const output = await pipelinedReadback;
+      pipelinedReadback = null;
+      const score = output.facePresence[0]!;
+      const effectiveThreshold = Math.min(scoreThreshold, 0.1);
+
+      if (score >= effectiveThreshold) {
+        const landmarks = convertLandmarks(output, pxROI, srcWidth, srcHeight);
+        const result = buildResult(landmarks, score);
+        trackedFaces = [{ landmarks }];
+        pipelinedResults = [result];
+        return [result];
       }
 
-      // All tracked faces lost — fall through to face detection
+      // Tracking failed on first frame — fall through to detection
+      resetPipeline();
       trackedFaces = [];
     }
 
     // ---- DETECTION PATH ----
     // No tracked faces (first frame or tracking lost) — run face detection
+    resetPipeline(); // ensure clean state
     const { detections: rawDetections, lbPadX: gpuLbPadX, lbPadY: gpuLbPadY } =
       await faceDetector.detectRawWithResize(uploadSource, srcWidth, srcHeight);
     lbPadX = gpuLbPadX;
@@ -487,20 +578,13 @@ export async function createFacemesh(options: FacemeshOptions = {}): Promise<Fac
       );
 
       if (result) {
-        // Map detector keypoint indices to landmark indices for keypoints
-        const detectorLandmarkIndices = [133, 362, 1, 13, 234, 454];
-        const faceKps = detectorLandmarkIndices.map(idx => result.landmarks[idx]!);
-
-        results.push({
-          score: result.score,
-          landmarks: result.landmarks,
-          keypoints: toFaceKeypoints(faceKps),
-        });
+        results.push(buildResult(result.landmarks, result.score));
       }
     }
 
     // Store for tracking on next frame
     trackedFaces = results.map(r => ({ landmarks: r.landmarks }));
+    pipelinedResults = results; // cache for pipeline bootstrap
 
     return results;
   }

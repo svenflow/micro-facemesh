@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>micro-facemesh — Live Demo</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --bg: #0a0a0a; --surface: #141414; --border: #222;
+      --text: #ededed; --text-secondary: #888;
+      --accent: #7c6aef; --accent-dim: rgba(124, 106, 239, 0.15);
+      --green: #34d399; --radius: 12px;
+      --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --mono: 'SF Mono', 'Menlo', 'Fira Code', monospace;
+    }
+    body { background: var(--bg); color: var(--text); font-family: var(--font); -webkit-font-smoothing: antialiased; }
+    .container { max-width: 700px; margin: 0 auto; padding: 16px; }
+    h1 { font-size: 24px; font-weight: 700; letter-spacing: -0.03em; margin-bottom: 4px; }
+    .subtitle { color: var(--text-secondary); font-size: 14px; margin-bottom: 12px; }
+
+    /* Model toggle */
+    .model-toggle {
+      display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap;
+    }
+    .toggle-btn {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+      padding: 6px 10px; font-size: 11px; font-weight: 500; color: var(--text-secondary);
+      cursor: pointer; transition: all 0.15s; font-family: var(--font);
+      display: flex; align-items: center; gap: 4px; white-space: nowrap;
+    }
+    .toggle-btn:hover { border-color: #444; color: var(--text); }
+    .toggle-btn.active { background: var(--accent-dim); border-color: var(--accent); color: var(--accent); }
+    .toggle-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: currentColor; opacity: 0.5;
+    }
+    .toggle-btn.active .toggle-dot { opacity: 1; }
+
+    /* Demo card */
+    .demo-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+    .demo-viewport { position: relative; background: #000; aspect-ratio: 4 / 3; }
+    .demo-viewport video {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      object-fit: cover; transform: scaleX(-1);
+    }
+    .demo-viewport canvas {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      object-fit: cover; transform: scaleX(-1);
+    }
+    .placeholder {
+      position: absolute; inset: 0;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      color: var(--text-secondary); gap: 16px;
+    }
+    .placeholder svg { width: 48px; height: 48px; opacity: 0.4; }
+    .start-btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      background: var(--accent); color: #fff; border: none; border-radius: 8px;
+      padding: 10px 20px; font-size: 14px; font-weight: 600; cursor: pointer;
+    }
+    .start-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .model-label-overlay {
+      position: absolute; top: 8px; left: 8px;
+      font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 4px;
+      font-family: var(--mono); display: none;
+    }
+    .model-label-overlay.micro { background: rgba(124, 106, 239, 0.8); color: #fff; }
+    .model-label-overlay.mediapipe { background: rgba(52, 211, 153, 0.8); color: #000; }
+    .error-bar {
+      background: #1a0505; color: #ef4444; padding: 8px 12px;
+      font-size: 12px; display: none; border-top: 1px solid #ef4444;
+    }
+
+    /* Stats */
+    .demo-stats { display: grid; grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--border); }
+    .demo-stat { padding: 12px; text-align: center; border-right: 1px solid var(--border); }
+    .demo-stat:last-child { border-right: none; }
+    .demo-stat .label { font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+    .demo-stat .value { font-size: 18px; font-weight: 700; font-family: var(--mono); }
+    .demo-stat .value.active { color: var(--green); }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>micro-facemesh 🧑</h1>
+    <p class="subtitle">Real-time 478-point face mesh via WebGPU. Zero dependencies.</p>
+
+    <div class="model-toggle">
+      <button class="toggle-btn active" data-model="micro" onclick="switchModel('micro')">
+        <span class="toggle-dot"></span>micro-facemesh
+      </button>
+      <button class="toggle-btn" data-model="mediapipe-gpu" onclick="switchModel('mediapipe-gpu')">
+        <span class="toggle-dot"></span>MediaPipe GPU
+      </button>
+      <button class="toggle-btn" data-model="mediapipe-wasm" onclick="switchModel('mediapipe-wasm')">
+        <span class="toggle-dot"></span>MediaPipe WASM
+      </button>
+    </div>
+
+    <div class="demo-card">
+      <div class="demo-viewport" id="viewport">
+        <video id="video" autoplay playsinline muted></video>
+        <canvas id="canvas"></canvas>
+        <div class="model-label-overlay micro" id="modelLabel">micro-facemesh</div>
+        <div class="placeholder" id="placeholder">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="12" cy="8" r="4"/>
+            <path d="M5 20c0-4 3-7 7-7s7 3 7 7"/>
+          </svg>
+          <p>Face mesh powered by WebGPU</p>
+          <button class="start-btn" id="startBtn" onclick="startDemo()">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21"/></svg>
+            Start Demo
+          </button>
+        </div>
+      </div>
+      <div class="error-bar" id="errorBar"></div>
+      <div class="demo-stats">
+        <div class="demo-stat">
+          <div class="label">Status</div>
+          <div class="value" id="statusVal">Idle</div>
+        </div>
+        <div class="demo-stat">
+          <div class="label">FPS</div>
+          <div class="value" id="fpsVal">&mdash;</div>
+        </div>
+        <div class="demo-stat">
+          <div class="label">Inference</div>
+          <div class="value" id="inferVal">&mdash;</div>
+        </div>
+        <div class="demo-stat">
+          <div class="label">Face</div>
+          <div class="value" id="faceVal">&mdash;</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    // --- Face mesh contour indices ---
+    const FACE_OVAL = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,152,148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109,10];
+    const LIPS_OUTER = [61,146,91,181,84,17,314,405,321,375,291,409,270,269,267,0,37,39,40,185,61];
+    const LIPS_INNER = [78,95,88,178,87,14,317,402,318,324,308,415,310,311,312,13,82,81,80,191,78];
+    const LEFT_EYE = [33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246,33];
+    const RIGHT_EYE = [362,382,381,380,374,373,390,249,263,466,388,387,386,385,384,398,362];
+    const LEFT_BROW = [46,53,52,65,55,70,63,105,66,107,46];
+    const RIGHT_BROW = [276,283,282,295,285,300,293,334,296,336,276];
+    const NOSE = [168,6,197,195,5,4,1,19,94,2,164,0];
+
+    const MESH_REGIONS = [
+      { indices: FACE_OVAL, color: 'rgba(124, 106, 239, 0.6)', width: 1.5 },
+      { indices: LIPS_OUTER, color: 'rgba(239, 68, 68, 0.7)', width: 1.2 },
+      { indices: LIPS_INNER, color: 'rgba(239, 68, 68, 0.5)', width: 1 },
+      { indices: LEFT_EYE, color: 'rgba(96, 165, 250, 0.8)', width: 1.2 },
+      { indices: RIGHT_EYE, color: 'rgba(96, 165, 250, 0.8)', width: 1.2 },
+      { indices: LEFT_BROW, color: 'rgba(251, 191, 36, 0.6)', width: 1 },
+      { indices: RIGHT_BROW, color: 'rgba(251, 191, 36, 0.6)', width: 1 },
+      { indices: NOSE, color: 'rgba(52, 211, 153, 0.5)', width: 1 },
+    ];
+
+    // --- State ---
+    let microFacemesh = null;
+    let mpFaceGpu = null;
+    let mpFaceWasm = null;
+    let activeModel = 'micro';
+    let running = false;
+    let loopGen = 0; // generation counter to prevent duplicate detect loops
+    let cameraReady = false;
+    let frameCount = 0;
+    let lastFpsTime = performance.now();
+    let inferEma = 0;
+    let inferInit = false;
+
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const placeholder = document.getElementById('placeholder');
+    const statusVal = document.getElementById('statusVal');
+    const fpsVal = document.getElementById('fpsVal');
+    const inferVal = document.getElementById('inferVal');
+    const faceVal = document.getElementById('faceVal');
+    const errorBar = document.getElementById('errorBar');
+    const modelLabel = document.getElementById('modelLabel');
+
+    let inputCanvas = null;
+    let inputCtx = null;
+
+    function showError(msg) { errorBar.textContent = msg; errorBar.style.display = 'block'; }
+    function clearError() { errorBar.style.display = 'none'; }
+
+    function resetStats() {
+      fpsVal.textContent = '\u2014';
+      inferVal.textContent = '\u2014';
+      faceVal.textContent = '\u2014';
+      faceVal.classList.remove('active');
+      frameCount = 0;
+      lastFpsTime = performance.now();
+      inferInit = false;
+    }
+
+    function updateInfer(ms) {
+      if (!inferInit) { inferEma = ms; inferInit = true; }
+      else { inferEma = 0.1 * ms + 0.9 * inferEma; }
+      inferVal.textContent = inferEma.toFixed(1) + 'ms';
+    }
+
+    function updateFps() {
+      frameCount++;
+      const now = performance.now();
+      if (now - lastFpsTime >= 500) {
+        fpsVal.textContent = Math.round((frameCount / (now - lastFpsTime)) * 1000);
+        frameCount = 0;
+        lastFpsTime = now;
+      }
+    }
+
+    function updateModelLabel() {
+      if (!running) { modelLabel.style.display = 'none'; return; }
+      modelLabel.style.display = 'block';
+      if (activeModel === 'micro') {
+        modelLabel.textContent = 'micro-facemesh';
+        modelLabel.className = 'model-label-overlay micro';
+      } else if (activeModel === 'mediapipe-gpu') {
+        modelLabel.textContent = 'MediaPipe GPU';
+        modelLabel.className = 'model-label-overlay mediapipe';
+      } else {
+        modelLabel.textContent = 'MediaPipe WASM';
+        modelLabel.className = 'model-label-overlay mediapipe';
+      }
+    }
+
+    function updateToggleUI() {
+      document.querySelectorAll('.toggle-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.model === activeModel);
+      });
+    }
+
+    // --- Drawing ---
+    function drawFaceMesh(landmarks, w, h) {
+      for (const region of MESH_REGIONS) {
+        ctx.strokeStyle = region.color;
+        ctx.lineWidth = region.width;
+        ctx.beginPath();
+        for (let i = 0; i < region.indices.length; i++) {
+          const lm = landmarks[region.indices[i]];
+          const x = lm.x * w, y = lm.y * h;
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+      ctx.fillStyle = 'rgba(52, 211, 153, 0.4)';
+      for (const lm of landmarks) {
+        ctx.beginPath();
+        ctx.arc(lm.x * w, lm.y * h, 1, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    function drawMediaPipeFace(faceLandmarks, w, h) {
+      // MediaPipe returns landmarks as array of {x, y, z} normalized [0,1]
+      for (const region of MESH_REGIONS) {
+        ctx.strokeStyle = region.color;
+        ctx.lineWidth = region.width;
+        ctx.beginPath();
+        for (let i = 0; i < region.indices.length; i++) {
+          const lm = faceLandmarks[region.indices[i]];
+          if (!lm) continue;
+          const x = lm.x * w, y = lm.y * h;
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+      ctx.fillStyle = 'rgba(52, 211, 153, 0.4)';
+      for (const lm of faceLandmarks) {
+        ctx.beginPath();
+        ctx.arc(lm.x * w, lm.y * h, 1, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // --- MediaPipe loaders ---
+    let visionModule = null;
+    async function loadVisionModule() {
+      if (visionModule) return visionModule;
+      visionModule = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/+esm');
+      return visionModule;
+    }
+
+    async function createMPFaceLandmarker(delegate) {
+      const { FilesetResolver, FaceLandmarker } = await loadVisionModule();
+      const vision = await FilesetResolver.forVisionTasks(
+        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm'
+      );
+      return await FaceLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+          delegate,
+        },
+        runningMode: 'VIDEO',
+        numFaces: 1,
+        outputFaceBlendshapes: false,
+        outputFacialTransformationMatrixes: false,
+      });
+    }
+
+    async function ensureMicroFacemesh() {
+      if (microFacemesh) return microFacemesh;
+      statusVal.textContent = 'Loading micro-facemesh...';
+      const { createFacemesh } = await import('./dist/index.js');
+      microFacemesh = await createFacemesh({
+        weightsUrl: './weights',
+        scoreThreshold: 0.5,
+        faceScoreThreshold: 0.3,
+      });
+      return microFacemesh;
+    }
+
+    async function ensureMediaPipeGpu() {
+      if (mpFaceGpu) return mpFaceGpu;
+      statusVal.textContent = 'Loading MediaPipe GPU...';
+      mpFaceGpu = await createMPFaceLandmarker('GPU');
+      return mpFaceGpu;
+    }
+
+    async function ensureMediaPipeWasm() {
+      if (mpFaceWasm) return mpFaceWasm;
+      statusVal.textContent = 'Loading MediaPipe WASM...';
+      mpFaceWasm = await createMPFaceLandmarker('CPU');
+      return mpFaceWasm;
+    }
+
+    // --- Model switching ---
+    window.switchModel = async function (model) {
+      if (model === activeModel) return;
+      activeModel = model;
+      updateToggleUI();
+      resetStats();
+
+      if (!running) { updateModelLabel(); return; }
+
+      running = false;
+      loopGen++; // kill any stale detect loops
+      clearError();
+
+      try {
+        if (model === 'micro') await ensureMicroFacemesh();
+        else if (model === 'mediapipe-gpu') await ensureMediaPipeGpu();
+        else await ensureMediaPipeWasm();
+
+        statusVal.textContent = 'Running';
+        running = true;
+        loopGen++; // new generation for new loop
+        updateModelLabel();
+        detectLoop();
+      } catch (err) {
+        statusVal.textContent = 'Error';
+        showError(err.message || 'Failed to load model.');
+        console.error(err);
+      }
+    };
+
+    // --- Start demo ---
+    window.startDemo = async function () {
+      document.getElementById('startBtn').disabled = true;
+      statusVal.textContent = 'Loading...';
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }
+        });
+        video.srcObject = stream;
+        await video.play();
+
+        const probeBmp = await createImageBitmap(video);
+        const vw = probeBmp.width, vh = probeBmp.height;
+        probeBmp.close();
+
+        canvas.width = vw;
+        canvas.height = vh;
+        document.getElementById('viewport').style.aspectRatio = `${vw} / ${vh}`;
+
+        inputCanvas = document.createElement('canvas');
+        inputCanvas.width = vw;
+        inputCanvas.height = vh;
+        inputCtx = inputCanvas.getContext('2d');
+        cameraReady = true;
+
+        if (activeModel === 'micro') await ensureMicroFacemesh();
+        else if (activeModel === 'mediapipe-gpu') await ensureMediaPipeGpu();
+        else await ensureMediaPipeWasm();
+
+        placeholder.style.display = 'none';
+        statusVal.textContent = 'Running';
+        running = true;
+        loopGen++; // start fresh generation
+        updateModelLabel();
+        lastFpsTime = performance.now();
+        frameCount = 0;
+        detectLoop();
+
+      } catch (err) {
+        statusVal.textContent = 'Error';
+        document.getElementById('startBtn').disabled = false;
+        if (err.name === 'NotAllowedError') showError('Camera permission denied.');
+        else if (err.message?.includes('WebGPU')) showError('WebGPU not supported. Try Chrome 113+ or Safari 18+.');
+        else showError(err.message || 'Unknown error');
+        console.error(err);
+      }
+    };
+
+    // --- Detect loop ---
+    let mpGpuTs = 0;
+    let mpWasmTs = 0;
+
+    async function detectLoop() {
+      const myGen = loopGen; // capture our generation
+      if (!running) return;
+
+      try {
+        if (activeModel === 'micro') await detectMicro();
+        else if (activeModel === 'mediapipe-gpu') detectMediaPipe(mpFaceGpu, true);
+        else detectMediaPipe(mpFaceWasm, false);
+      } catch (err) {
+        if (myGen !== loopGen) return; // stale loop
+        console.error(err);
+      }
+
+      // Only schedule next frame if we're still the active loop
+      if (running && myGen === loopGen) {
+        requestAnimationFrame(detectLoop);
+      }
+    }
+
+    async function detectMicro() {
+      // Pass video directly — no canvas intermediate needed
+      // (detect() handles HTMLVideoElement via copyExternalImageToTexture)
+      const t0 = performance.now();
+      const faces = await microFacemesh.detect(video);
+      updateInfer(performance.now() - t0);
+      updateFps();
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (faces.length > 0) {
+        faceVal.textContent = faces[0].score.toFixed(2);
+        faceVal.classList.add('active');
+        drawFaceMesh(faces[0].landmarks, canvas.width, canvas.height);
+      } else {
+        faceVal.textContent = '\u2014';
+        faceVal.classList.remove('active');
+      }
+    }
+
+    function detectMediaPipe(landmarker, isGpu) {
+      if (isGpu) mpGpuTs += 33; else mpWasmTs += 33;
+      const ts = isGpu ? mpGpuTs : mpWasmTs;
+
+      const t0 = performance.now();
+      const results = landmarker.detectForVideo(video, ts);
+      updateInfer(performance.now() - t0);
+      updateFps();
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (results?.faceLandmarks?.length > 0) {
+        faceVal.textContent = '1';
+        faceVal.classList.add('active');
+        drawMediaPipeFace(results.faceLandmarks[0], canvas.width, canvas.height);
+      } else {
+        faceVal.textContent = '\u2014';
+        faceVal.classList.remove('active');
+      }
+    }
+  </script>
+</body>
+</html>

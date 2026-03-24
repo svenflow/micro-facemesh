@@ -102,12 +102,15 @@ type FaceLandmarkName = keyof typeof FACE_LANDMARK_INDICES;
  *    Block 4:  36->42, stride 1, 32x32
  *    Block 5:  42->48, stride 2, 32->16  (stride-2 transition)
  *    Block 6:  48->56, stride 1, 16x16
- *    Block 7:  56->64, stride 1, 16x16   [SSD head 1: 16x16, 88ch after block 8]
+ *    Block 7:  56->64, stride 1, 16x16
  *    Block 8:  64->72, stride 1, 16x16
  *    Block 9:  72->80, stride 1, 16x16
  *    Block 10: 80->88, stride 1, 16x16   -> 16x16 SSD head (88ch, 2 anchors)
  *    Block 11: 88->96, stride 2, 16->8   (stride-2 transition)
- *    -> 8x8 SSD head (96ch, 6 anchors)
+ *    Block 12: 96->96, stride 1, 8x8
+ *    Block 13: 96->96, stride 1, 8x8
+ *    Block 14: 96->96, stride 1, 8x8
+ *    Block 15: 96->96, stride 1, 8x8     -> 8x8 SSD head (96ch, 6 anchors)
  *
  * SSD outputs:
  *   16x16: 2 classifiers + 32 regressors (2 anchors x 16 values) = 512 anchors
@@ -288,7 +291,7 @@ interface WeightsMetadata {
 interface FaceLandmarksOutput {
     /** 478 landmarks x 3 (x, y, z) = 1434 values, normalized to [0,1] in crop space */
     landmarks: Float32Array;
-    /** Face presence score (1 value, raw — apply sigmoid externally) */
+    /** Face presence score (1 value, already sigmoid'd, 0-1 range) */
     facePresence: Float32Array;
 }
 interface CompiledFaceLandmarkModel {
@@ -296,6 +299,14 @@ interface CompiledFaceLandmarkModel {
     run: (input: Float32Array) => Promise<FaceLandmarksOutput>;
     runFromCanvas: (source: HTMLCanvasElement | OffscreenCanvas | ImageBitmap) => Promise<FaceLandmarksOutput>;
     runFromGPUBuffer: (inputBuffer: GPUBuffer) => Promise<FaceLandmarksOutput>;
+    /** Encode landmark inference into an existing command encoder (no submit). */
+    encodeFromGPUBuffer: (inputBuffer: GPUBuffer, encoder: GPUCommandEncoder) => void;
+    /** Read back results after submitting an encoder that called encodeFromGPUBuffer (blocking). */
+    readbackLandmarks: () => Promise<FaceLandmarksOutput>;
+    /** Begin non-blocking readback. Returns promise that resolves when GPU finishes. */
+    beginReadbackLandmarks: () => Promise<FaceLandmarksOutput>;
+    /** Flip to the other readback buffer (for double-buffered pipelining). */
+    flipReadbackBuffer: () => void;
 }
 /**
  * Load face landmark weights from JSON metadata + binary buffer.

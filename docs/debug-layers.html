@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Debug Layer-by-Layer</title>
+  <style>
+    body { background: #0a0a0a; color: #ededed; font-family: monospace; padding: 12px; font-size: 13px; }
+    .ok { color: #34d399; } .err { color: #ef4444; } .num { color: #60a5fa; } .warn { color: #fbbf24; }
+    .row { display: flex; gap: 4px; padding: 1px 0; }
+    .label { color: #888; min-width: 260px; }
+    .val { font-weight: 600; }
+    .section { margin: 10px 0 4px; font-weight: 700; font-size: 14px; color: #7c6aef; }
+  </style>
+</head>
+<body>
+  <h2>Layer-by-Layer CPU Reference (zero input)</h2>
+  <div id="log"></div>
+  <script type="module">
+    const log = document.getElementById('log');
+    function row(l, v, c='') {
+      const d = document.createElement('div');
+      d.className = 'row';
+      d.innerHTML = `<span class="label">${l}</span><span class="val ${c}">${v}</span>`;
+      log.appendChild(d);
+    }
+    function section(t) { const d = document.createElement('div'); d.className = 'section'; d.textContent = t; log.appendChild(d); }
+    function fmtRange(arr) { return `[${Math.min(...arr).toFixed(4)}, ${Math.max(...arr).toFixed(4)}]`; }
+
+    async function run() {
+      const { loadFaceLandmarkWeights } = await import('./dist/index.js');
+      const [metaRes, binRes] = await Promise.all([
+        fetch('./weights/face_landmarks_weights_f16.json'),
+        fetch('./weights/face_landmarks_weights_f16.bin'),
+      ]);
+      const meta = await metaRes.json();
+      const buf = await binRes.arrayBuffer();
+      const weights = loadFaceLandmarkWeights(meta, buf);
+      const keyList = Array.from(weights.keys());
+
+      function fw(...subs) {
+        const k = keyList.find(k => subs.every(s => k.includes(s)));
+        if (!k) throw new Error(`Not found: ${subs}`);
+        return weights.get(k);
+      }
+
+      // State: current activation per channel (spatially constant for zero input)
+      // For zero input, all spatial positions are identical, so we only track per-channel values
+      let bnNum = 132, preluNum = 126, convNum = 82, dwNum = 60;
+
+      function nextBN() { return fw(`batch_normalization_${bnNum++}`).data; }
+      function nextPReLU() { return fw(`p_re_lu_${preluNum++}`).data; }
+      function nextConv() { const t = fw(`conv2d_${convNum++}`, 'Conv2D'); return { data: t.data, shape: t.shape }; }
+      function nextDWkernel() {
+        let t;
+        try { t = fw(`depthwise_conv2d_${dwNum}/depthwise`); }
+        catch { t = fw(`depthwise_conv2d_${dwNum}/depthwise1`); }
+        dwNum++;
+        return { data: t.data, shape: t.shape };
+      }
+
+      // CPU conv1x1: input[inCh] → output[outCh] (spatially constant)
+      // Weight: [outCh, 1, 1, inCh] in OHWI = flat [outCh * inCh]
+      function conv1x1(input, weight, bias, inCh, outCh) {
+        const out = new Float32Array(outCh);
+        for (let oc = 0; oc < outCh; oc++) {
+          let sum = 0;
+          for (let ic = 0; ic < inCh; ic++) {
+            // OHWI: weight[oc, 0, 0, ic] = weight[oc * inCh + ic]
+            sum += input[ic] * weight[oc * inCh + ic];
+          }
+          out[oc] = sum + bias[oc];
+        }
+        return out;
+      }
+
+      // CPU DW 3x3 (spatially constant, stride 1):
+      // For constant input, output = input * sum(kernel_weights)
+      // DW kernel in TFLite: [1, kH, kW, ch]
+      function dw3x3_constant(input, kernel, ch) {
+        const out = new Float32Array(ch);
+        const [, kH, kW, kCh] = kernel.shape;
+        for (let c = 0; c < ch; c++) {
+          let wsum = 0;
+          for (let ky = 0; ky < kH; ky++) {
+            for (let kx = 0; kx < kW; kx++) {
+              // [1, ky, kx, c] = ky * kW * ch + kx * ch + c
+              wsum += kernel.data[ky * kW * kCh + kx * kCh + c];
+            }
+          }
+          out[c] = input[c] * wsum; // + 0 (zero bias)
+        }
+        return out;
+      }
+
+      // PReLU: standard formula
+      function prelu(input, alpha) {
+        const out = new Float32Array(input.length);
+        for (let i = 0; i < input.length; i++) {
+          out[i] = input[i] >= 0 ? input[i] : input[i] * alpha[i];
+        }
+        return out;
+      }
+
+      // === STEM ===
+      section('STEM');
+      const stemW = fw('conv2d_81', 'Conv2D');
+      const stemBias = nextBN(); // BN_132
+      const stemAlpha = nextPReLU(); // PReLU_126
+      convNum = 82; // stem was manual, conv counter starts at 82
+
+      // Zero input: conv output = bias, then PReLU
+      let cur = prelu(stemBias, stemAlpha);
+      let curCh = 16;
+      let curH = 128;
+      row('After stem', `ch=${curCh} range=${fmtRange(cur)}`, 'ok');
+      row('  values', `[${Array.from(cur).map(v=>v.toFixed(4))}]`);
+
+      // === STAGE 1: 4 blocks at 128x128, 16ch, bottleneck 8 ===
+      section('STAGE 1 (4 blocks, 16ch, bn=8)');
+      for (let blk = 0; blk < 4; blk++) {
+        const narrowW = nextConv(); // 16→8
+        const narrowBN = nextBN();
+        const narrowAlpha = nextPReLU();
+        const dwK = nextDWkernel(); // 8ch DW
+        const projW = nextConv(); // 8→16
+        const projBN = nextBN();
+        const projAlpha = nextPReLU();
+
+        // Narrow: 16→8 with BN+PReLU
+        let t = conv1x1(cur, narrowW.data, narrowBN, curCh, 8);
+        t = prelu(t, narrowAlpha);
+
+        // DW 3x3 (constant spatial)
+        t = dw3x3_constant(t, dwK, 8);
+
+        // Project: 8→16 with BN (no PReLU yet)
+        t = conv1x1(t, projW.data, projBN, 8, 16);
+
+        // ADD: t + cur
+        const added = new Float32Array(16);
+        for (let i = 0; i < 16; i++) added[i] = t[i] + cur[i];
+
+        // PReLU after ADD
+        cur = prelu(added, projAlpha);
+        row(`  Block ${blk} out`, `range=${fmtRange(cur)}`, Math.max(...cur.map(Math.abs)) < 100 ? 'ok' : 'warn');
+      }
+
+      // === DOWN 1: 16→16, pad 16→32 ===
+      section('DOWN 1');
+      const d1W = nextConv(); // conv2d_90
+      const d1BN = nextBN();
+      const d1Alpha = nextPReLU();
+
+      // Conv 2x2 s=2 on constant input:
+      // output = sum over 2x2x16 * weights + bias
+      // Weight: [16, 2, 2, 16], output per channel = sum over 4 spatial * 16 input ch
+      function conv2x2_constant(input, weight, bias, inCh, outCh) {
+        const out = new Float32Array(outCh);
+        for (let oc = 0; oc < outCh; oc++) {
+          let sum = 0;
+          for (let ic = 0; ic < inCh; ic++) {
+            for (let ky = 0; ky < 2; ky++) {
+              for (let kx = 0; kx < 2; kx++) {
+                // OHWI: [oc, ky, kx, ic] = oc * 4 * inCh + ky * 2 * inCh + kx * inCh + ic
+                sum += input[ic] * weight[oc * 4 * inCh + ky * 2 * inCh + kx * inCh + ic];
+              }
+            }
+          }
+          out[oc] = sum + bias[oc];
+        }
+        return out;
+      }
+
+      // Conv 2x2 s=2: cur→convOut
+      let convOut = conv2x2_constant(cur, d1W.data, d1BN, 16, 16);
+
+      // MaxPool on constant input = identity
+      let poolOut = new Float32Array(cur);
+
+      // Channel pad: 16→32 (append zeros)
+      let padOut = new Float32Array(32);
+      for (let i = 0; i < 16; i++) padOut[i] = poolOut[i];
+
+      // ADD: convOut (16ch) + padOut (first 16ch)
+      let downAdded = new Float32Array(16);
+      for (let i = 0; i < 16; i++) downAdded[i] = convOut[i] + padOut[i];
+
+      // PReLU with down1 alpha
+      cur = prelu(downAdded, d1Alpha);
+      curCh = 16;
+      curH = 64;
+      row('After down1', `ch=${curCh} range=${fmtRange(cur)}`, Math.max(...cur.map(Math.abs)) < 100 ? 'ok' : 'warn');
+
+      // === STAGE 2: 5 blocks at 64x64, 32ch ===
+      section('STAGE 2 (5 blocks, 32ch, bn=16)');
+      // Block 1 (first block, no narrow, no skip)
+      {
+        const dwK = nextDWkernel(); // DW on 16ch
+        const projW = nextConv(); // conv2d_91: 16→32
+        const projBN = nextBN();
+        const projAlpha = nextPReLU();
+
+        let t = dw3x3_constant(cur, dwK, curCh);
+        t = conv1x1(t, projW.data, projBN, curCh, 32);
+        cur = prelu(t, projAlpha);
+        curCh = 32;
+        row(`  Block 0 (first)`, `range=${fmtRange(cur)}`, Math.max(...cur.map(Math.abs)) < 100 ? 'ok' : 'warn');
+      }
+      // Blocks 1-4 (regular with skip)
+      for (let blk = 1; blk < 5; blk++) {
+        const narrowW = nextConv();
+        const narrowBN = nextBN();
+        const narrowAlpha = nextPReLU();
+        const dwK = nextDWkernel();
+        const projW = nextConv();
+        const projBN = nextBN();
+        const projAlpha = nextPReLU();
+
+        let t = conv1x1(cur, narrowW.data, narrowBN, 32, 16);
+        t = prelu(t, narrowAlpha);
+        t = dw3x3_constant(t, dwK, 16);
+        t = conv1x1(t, projW.data, projBN, 16, 32);
+        const added = new Float32Array(32);
+        for (let i = 0; i < 32; i++) added[i] = t[i] + cur[i];
+        cur = prelu(added, projAlpha);
+        row(`  Block ${blk}`, `range=${fmtRange(cur)}`, Math.max(...cur.map(Math.abs)) < 100 ? 'ok' : 'warn');
+      }
+
+      // Continue for remaining stages in summary form
+      async function runStage(stageNum, ch, bn, numBlocks) {
+        section(`DOWN ${stageNum}`);
+        const dW = nextConv();
+        const dBN = nextBN();
+        const dAlpha = nextPReLU();
+        const outCh = dW.shape[0]; // conv output channels
+        let cOut = conv2x2_constant(cur, dW.data, dBN, curCh, outCh);
+        let pool = new Float32Array(cur);
+        // ADD (first outCh elements)
+        let da = new Float32Array(outCh);
+        for (let i = 0; i < outCh; i++) da[i] = cOut[i] + pool[i];
+        cur = prelu(da, dAlpha);
+        curCh = outCh;
+        curH = curH / 2;
+        row(`After down${stageNum}`, `ch=${curCh} range=${fmtRange(cur)}`, Math.max(...cur.map(Math.abs)) < 1000 ? 'ok' : 'warn');
+
+        section(`STAGE ${stageNum + 1} (${numBlocks} blocks, ${ch}ch, bn=${bn})`);
+        // First block (no narrow, no skip)
+        {
+          const dwK = nextDWkernel();
+          const projW = nextConv();
+          const projBN = nextBN();
+          const projAlpha = nextPReLU();
+          let t = dw3x3_constant(cur, dwK, curCh);
+          t = conv1x1(t, projW.data, projBN, curCh, ch);
+          cur = prelu(t, projAlpha);
+          curCh = ch;
+          row(`  Block 0 (first)`, `range=${fmtRange(cur)}`, Math.max(...cur.map(Math.abs)) < 1000 ? 'ok' : 'warn');
+        }
+        // Remaining blocks
+        for (let blk = 1; blk < numBlocks; blk++) {
+          const narrowW = nextConv();
+          const narrowBN = nextBN();
+          const narrowAlpha = nextPReLU();
+          const dwK = nextDWkernel();
+          const projW = nextConv();
+          const projBN = nextBN();
+          const projAlpha = nextPReLU();
+
+          let t = conv1x1(cur, narrowW.data, narrowBN, ch, bn);
+          t = prelu(t, narrowAlpha);
+          t = dw3x3_constant(t, dwK, bn);
+          t = conv1x1(t, projW.data, projBN, bn, ch);
+          const added = new Float32Array(ch);
+          for (let i = 0; i < ch; i++) added[i] = t[i] + cur[i];
+          cur = prelu(added, projAlpha);
+          row(`  Block ${blk}`, `range=${fmtRange(cur)}`, Math.max(...cur.map(Math.abs)) < 1000 ? 'ok' : 'warn');
+        }
+      }
+
+      // Down2 + Stage 3: 64ch, bn=32
+      await runStage(2, 64, 32, 5);
+      // Down3 + Stage 4: 128ch, bn=64
+      await runStage(3, 128, 64, 5);
+      // Down4 + Stage 5: 128ch, bn=64
+      await runStage(4, 128, 64, 5);
+      // Down5 + Stage 6: 128ch, bn=64
+      await runStage(5, 128, 64, 5);
+      // Down6 + Stage 7: 128ch, bn=64
+      await runStage(6, 128, 64, 5);
+
+      // === OUTPUT HEADS ===
+      section('OUTPUT HEADS');
+      // Landmarks: conv2d_150 [1434, 2, 2, 128] + bias
+      const lmW = fw('conv2d_150', 'Conv2D');
+      const lmBias = fw('conv2d_150', 'BiasAdd');
+      // For constant spatial input at 2x2, conv 2x2 = dot product over all 2x2x128 = 512 values
+      const landmarks = conv2x2_constant(cur, lmW.data, lmBias.data, 128, 1434);
+      row('LM[0] (x,y,z)', `${landmarks[0].toFixed(4)}, ${landmarks[1].toFixed(4)}, ${landmarks[2].toFixed(4)}`, 'num');
+      row('LM range', fmtRange(landmarks), 'num');
+
+      // Presence: conv2d_151 (inner model head; conv2d_152 is outer wrapper, wrong)
+      const presW = fw('conv2d_151', 'Conv2D');
+      const presBias = fw('conv2d_151', 'BiasAdd');
+      const presence = conv2x2_constant(cur, presW.data, presBias.data, 128, 1);
+      row('Presence raw', presence[0].toFixed(4), 'num');
+      row('Presence sigmoid', (1 / (1 + Math.exp(-presence[0]))).toFixed(6), 'num');
+
+      row('Done', 'OK', 'ok');
+    }
+
+    run().catch(e => {
+      const d = document.createElement('div');
+      d.style.cssText = 'background:#1a0505;border:1px solid #ef4444;padding:8px;margin:8px 0;white-space:pre-wrap;';
+      d.textContent = `Fatal: ${e.message}\n${e.stack}`;
+      log.appendChild(d);
+    });
+  </script>
+</body>
+</html>

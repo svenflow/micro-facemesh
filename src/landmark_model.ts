@@ -73,6 +73,7 @@ import {
   LM_DEPTHWISE_3X3_SHADER,
   LM_CONV1X1_SHADER,
   LM_ADD_SHADER,
+  LM_ADD_PRELU_SHADER,
   LM_CONV2X2_S2_SHADER,
   LM_MAXPOOL_2X2_SHADER,
   LM_CHANNEL_PAD_SHADER,
@@ -106,8 +107,14 @@ export interface CompiledLandmarkModel {
   device: GPUDevice;
   /** Run the landmark model. Input is a GPUBuffer with CHW float32 [3,256,256]. */
   run: (inputBuffer: GPUBuffer, encoder: GPUCommandEncoder) => void;
-  /** Read back results after GPU submission */
+  /** Read back results after GPU submission (blocking — waits for GPU to finish) */
   readback: () => Promise<LandmarkOutput>;
+  /** Begin non-blocking readback. Call after submit, then await the promise later.
+   *  Uses double-buffered readback so GPU can write to the other buffer while this one is mapped. */
+  beginReadback: () => Promise<LandmarkOutput>;
+  /** Flip to the other readback buffer. Call this before encoding the next frame
+   *  so the GPU writes to a different buffer than the one being mapped. */
+  flipReadbackBuffer: () => void;
   /** The input buffer size expected (3 * 256 * 256 * 4 bytes) */
   inputBufferSize: number;
 }
@@ -263,6 +270,7 @@ export async function compileLandmarkModel(
   const L3pool = makeLayout(['r', 's', 'u']); // maxpool
   const L3pad = makeLayout(['r', 's', 'u']); // channel_pad
   const L4prelu = makeLayout(['r', 'r', 's', 'u']); // prelu
+  const L5addPrelu = makeLayout(['r', 'r', 'r', 's', 'u']); // fused add+prelu
   const L3sig = makeLayout(['r', 's', 'u']); // sigmoid
 
   // ============ Pipelines ============
@@ -277,6 +285,7 @@ export async function compileLandmarkModel(
   const pipeOutConv = makePipe(L5, LM_OUTPUT_CONV2X2_SHADER);
   const pipeSigmoid = makePipe(L3sig, LM_SIGMOID_SHADER);
   const pipePReLU = makePipe(L4prelu, LM_PRELU_SHADER);
+  const pipeAddPReLU = makePipe(L5addPrelu, LM_ADD_PRELU_SHADER);
 
   // ============ Activation Buffers ============
   // Max intermediate: 128 * 128 * 128 = 2M floats = 8MB (generous)
@@ -291,7 +300,12 @@ export async function compileLandmarkModel(
   const bufLM = makeBuf(1434 * 4, SOC);
   const bufPres = makeBuf(4, SOC);
   const bufPresSig = makeBuf(4, SOC);
-  const readbackBuf = makeBuf((1434 + 1) * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+  // Double-buffered readback: GPU writes to one buffer while CPU reads the other
+  const readbackBufs = [
+    makeBuf((1434 + 1) * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST),
+    makeBuf((1434 + 1) * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST),
+  ];
+  let readbackIdx = 0;
 
   // ============ Weight Index Tracking ============
   let bnNum = 132;
@@ -404,15 +418,9 @@ export async function compileLandmarkModel(
       [C8(h), C8(h), ch]);
 
     if (hasSkip) {
-      // ADD: t1 + cur -> t2
-      const addN = ch * h * h;
-      const addU = makeU([addN]);
-      emit(pipeAdd, bind(L4add, [t1, cur, t2, addU]),
-        [C256(addN), 1, 1]);
-
-      // PReLU: t2 -> t3
+      // Fused ADD + PReLU: t1 + cur -> t3 (saves one dispatch)
       const preluU = makeU([ch, h, h]);
-      emit(pipePReLU, bind(L4prelu, [t2, projBP.prelu, t3, preluU]),
+      emit(pipeAddPReLU, bind(L5addPrelu, [t1, cur, projBP.prelu, t3, preluU]),
         [C8(h), C8(h), ch]);
 
       // Rotate: cur = t3, old cur and t1/t2 become temps
@@ -433,80 +441,76 @@ export async function compileLandmarkModel(
     curCh = ch;
   }
 
-  /** Emit first block of a new stage (no narrow conv, no skip) */
-  function emitFirstBlock(ch: number, bn: number, h: number) {
-    // DW 3x3 on cur (which has bn channels = bottleneck from downsample)
-    const dwBuf = nextDW();
-    const dwZeroBias = uploadF32(new Float32Array(curCh));
-    const dwU = makeU([curCh, h, h, h, h, 1, 1]);
-
-    // cur -> t1 (DW)
-    emit(pipeDW, bind(L5, [cur, dwBuf, dwZeroBias, t1, dwU]),
-      [C8(h), C8(h), curCh]);
-
-    // project 1x1 (curCh -> ch) + BN
-    const projConv = nextConv();
-    const projBP = nextBNPReLU();
-    const projU = makeU([curCh, ch, h, h]);
-
-    // t1 -> t2 (project + BN)
-    emit(pipeConv1x1, bind(L5, [t1, projConv.buf, projBP.bn, t2, projU]),
-      [C8(h), C8(h), ch]);
-
-    // No skip ADD for first block.
-    // PReLU: t2 -> t1
-    const preluU = makeU([ch, h, h]);
-    emit(pipePReLU, bind(L4prelu, [t2, projBP.prelu, t1, preluU]),
-      [C8(h), C8(h), ch]);
-
-    const oldCur = cur;
-    cur = t1;
-    t1 = oldCur;
-    curCh = ch;
-  }
-
-  /** Emit downsample transition */
-  function emitDownsample(outCh: number, padCh: number | null) {
+  /** Emit downsample + first block of next stage.
+   *
+   * Correct TFLite wiring (verified from op graph):
+   *   Input ──┬── Conv2x2_s2 + BN ──→ PReLU ──→ DW3x3 ──→ Project1x1 + BN ──┐
+   *           │                                                                 │
+   *           └── MaxPool2x2_s2 ──→ [ChannelPad if needed] ───────────────────→ ADD ──→ PReLU
+   *
+   * @param outCh - Conv2x2 output channels (= bottleneck width for DW/project)
+   * @param ch    - Final output channels after project (= stage channel width)
+   * @param padCh - Pad maxpool to this many channels (null if no padding needed)
+   */
+  function emitDownsampleAndFirstBlock(outCh: number, ch: number, padCh: number | null) {
     const newH = curH / 2;
     const inCh = curCh;
 
-    // 1. Conv 2x2 s=2: cur -> t1
+    // === DOWNSAMPLE CONV: Conv 2x2 s=2 + BN ===
+    // cur → t1
     const downConv = nextConv();
     const downBP = nextBNPReLU();
     const downU = makeU([inCh, outCh, curH, curH, newH, newH]);
-
     emit(pipeConv2x2, bind(L5, [cur, downConv.buf, downBP.bn, t1, downU]),
       [C8(newH), C8(newH), outCh]);
 
-    // 2. MaxPool 2x2 s=2: cur -> t2
+    // === MAXPOOL 2x2 s=2 ===
+    // cur → t2
     const mpU = makeU([inCh, curH, curH, newH, newH]);
     emit(pipeMaxPool, bind(L3pool, [cur, t2, mpU]),
       [C8(newH), C8(newH), inCh]);
 
-    // 3. Channel PAD (if needed): t2 -> t3
-    let poolBuf: GPUBuffer;
+    // === CHANNEL PAD (if needed) ===
+    // t2 → t3 (or skipBuf = t2 if no pad)
+    let skipBuf: GPUBuffer;
     if (padCh !== null && padCh > inCh) {
       const padU = makeU([inCh, padCh, newH, newH]);
       emit(pipePad, bind(L3pad, [t2, t3, padU]),
         [C8(newH), C8(newH), padCh]);
-      poolBuf = t3;
+      skipBuf = t3;
     } else {
-      poolBuf = t2;
+      skipBuf = t2;
     }
 
-    // 4. ADD: t1 + poolBuf -> t4
-    const addN = outCh * newH * newH;
-    const addU = makeU([addN]);
-    emit(pipeAdd, bind(L4add, [t1, poolBuf, t4, addU]),
-      [C256(addN), 1, 1]);
-
-    // 5. PReLU: t4 -> cur
-    const preluU = makeU([outCh, newH, newH]);
-    emit(pipePReLU, bind(L4prelu, [t4, downBP.prelu, cur, preluU]),
+    // === PRELU ON CONV OUTPUT (not on ADD!) ===
+    // t1 → t4
+    const preluU1 = makeU([outCh, newH, newH]);
+    emit(pipePReLU, bind(L4prelu, [t1, downBP.prelu, t4, preluU1]),
       [C8(newH), C8(newH), outCh]);
 
-    // After downsample, cur still points to the same buffer but has new content
-    curCh = outCh;
+    // === FIRST BLOCK: DW 3x3 ===
+    // t4 → cur (original input buffer, now free after maxpool read it)
+    const dwBuf = nextDW();
+    const dwZeroBias = uploadF32(new Float32Array(outCh));
+    const dwU = makeU([outCh, newH, newH, newH, newH, 1, 1]);
+    emit(pipeDW, bind(L5, [t4, dwBuf, dwZeroBias, cur, dwU]),
+      [C8(newH), C8(newH), outCh]);
+
+    // === FIRST BLOCK: PROJECT 1x1 + BN ===
+    // cur → t1
+    const projConv = nextConv();
+    const projBP = nextBNPReLU();
+    const projU = makeU([outCh, ch, newH, newH]);
+    emit(pipeConv1x1, bind(L5, [cur, projConv.buf, projBP.bn, t1, projU]),
+      [C8(newH), C8(newH), ch]);
+
+    // === Fused ADD + PRELU: project + skip → cur (saves one dispatch) ===
+    const preluU2 = makeU([ch, newH, newH]);
+    emit(pipeAddPReLU, bind(L5addPrelu, [t1, skipBuf, projBP.prelu, cur, preluU2]),
+      [C8(newH), C8(newH), ch]);
+
+    // cur still points to the same physical buffer, now with downsample+firstblock output
+    curCh = ch;
     curH = newH;
   }
 
@@ -515,144 +519,46 @@ export async function compileLandmarkModel(
     emitResBlock(16, 8, 128, true);
   }
 
-  // Down 1: 16->16, pad maxpool 16->32
-  emitDownsample(16, 32);
-  // After: curCh=16, curH=64
-
-  // Stage 2: 5 blocks, 32ch, bottleneck 16
-  // Block 1: no narrow, no skip (transforms 16->32)
-  emitFirstBlock(32, 16, 64);
-  // Blocks 2-5: regular with skip
+  // Down 1 + Stage 2 first block: conv 16→16, pad maxpool 16→32, project 16→32
+  emitDownsampleAndFirstBlock(16, 32, 32);
+  // After: curCh=32, curH=64
+  // Stage 2 blocks 2-5: regular with skip
   for (let i = 0; i < 4; i++) {
     emitResBlock(32, 16, 64, true);
   }
 
-  // Down 2: 32->32, pad maxpool 32->64
-  emitDownsample(32, 64);
-  // After: curCh=32, curH=32
-
-  // Stage 3: 5 blocks, 64ch, bottleneck 32
-  emitFirstBlock(64, 32, 32);
+  // Down 2 + Stage 3 first block: conv 32→32, pad maxpool 32→64, project 32→64
+  emitDownsampleAndFirstBlock(32, 64, 64);
+  // After: curCh=64, curH=32
   for (let i = 0; i < 4; i++) {
     emitResBlock(64, 32, 32, true);
   }
 
-  // Down 3: 64->64, pad maxpool 64->128
-  emitDownsample(64, 128);
-  // After: curCh=64, curH=16
-
-  // Stage 4: 5 blocks, 128ch, bottleneck 64
-  emitFirstBlock(128, 64, 16);
+  // Down 3 + Stage 4 first block: conv 64→64, pad maxpool 64→128, project 64→128
+  emitDownsampleAndFirstBlock(64, 128, 128);
+  // After: curCh=128, curH=16
   for (let i = 0; i < 4; i++) {
     emitResBlock(128, 64, 16, true);
   }
 
-  // Down 4: 128->64, NO pad (conv outputs 64ch, maxpool outputs 128ch)
-  // Wait, ADD requires same size. Conv outputs [64, 8, 8] and maxpool outputs [128, 8, 8].
-  // They can't be added. Let me check: maybe only the first 64ch of maxpool are used?
-  // Or maybe there's no ADD and it's just the conv output?
-  //
-  // Actually, looking at the TFLite op structure more carefully:
-  // Down 4 conv: [64, 2, 2, 128] -> takes 128ch input, outputs 64ch
-  // MaxPool: takes 128ch, outputs 128ch
-  // To make ADD work: maxpool 128ch is somehow reduced to 64ch.
-  //
-  // One possibility: the "channel padding" for these transitions pads the CONV
-  // output up to match maxpool (128ch). But there are only 3 channel_padding ops.
-  //
-  // Another possibility: these downsamples don't have ADD at all. The conv output
-  // is just used directly. This would remove 3 ADDs from the count:
-  // 34 block ADDs + 3 padded-down ADDs + 3 non-padded-down = 40 != 34.
-  // 34 block ADDs + 3 padded-down ADDs = 37 != 34.
-  //
-  // Hmm. Let me reconsider: 28 block ADDs (stage1=4, stages2-7 first block no ADD = 4 each * 6 = 24,
-  // total = 4+24 = 28). Plus 6 downsample ADDs = 34. YES!
-  //
-  // So: 28 block ADDs + 6 downsample ADDs = 34 total ADDs.
-  // This means ALL downsamples have ADD, and only blocks 2-N of each stage (not block 1) have ADD.
-  //
-  // For down 4-6: conv outputs 64ch, maxpool outputs 128ch. ADD requires same size.
-  // So we need to truncate the maxpool to 64ch, or something else.
-  //
-  // Let me check: maybe the MaxPool for these transitions isn't on the full 128ch.
-  // The 6 MAX_POOL_2D ops (one per downsample) - they pool whatever comes in.
-  //
-  // Actually, I think for down 4-6, the pattern is:
-  //   Conv 2x2 s=2 (128->64): outputs [64, newH, newH]
-  //   MaxPool 2x2 s=2 on input [128, H, H]: outputs [128, newH, newH]
-  //   The maxpool output is then truncated/sliced to 64ch for ADD.
-  //   Or alternatively, the maxpool is on a different tensor.
-  //
-  // Wait, a simpler explanation: maybe the MaxPool for these transitions pools
-  // to [128, newH, newH], then the ADD is:
-  //   ADD(conv_64ch_padded_to_128ch, maxpool_128ch)
-  //
-  // But there are only 3 channel_padding ops total, all used for stages 1-3.
-  // For stages 4-6 (where conv outputs 64ch), there must be different handling.
-  //
-  // I think the most likely explanation given the TFLite analysis is:
-  // For down 4-6, the maxpool output is taken as only the first 64 channels
-  // (a slice/gather op that shows up as something else), OR the conv output
-  // is padded to 128ch (but we don't have padding ops for these).
-  //
-  // Let me just trust the weight shapes and architecture description:
-  // Down 4: conv2d_120 [64, 2, 2, 128] outputs 64ch. MaxPool gives 128ch.
-  // ADD(64ch, 64ch) -> 64ch. So maxpool must be reduced to 64ch somehow.
-  //
-  // The simplest explanation: the maxpool output is sliced to the first 64 channels.
-  // In TFLite, this might be done via a strided slice or gather op that I'm not
-  // counting in the op list (DEQUANTIZE ops perhaps, or it's implicit).
-  //
-  // For implementation, I'll maxpool the full input, then take only the first
-  // outCh channels for the ADD. Since our maxpool shader can output all channels,
-  // and the ADD shader just adds element-wise, I need to make sure I only ADD
-  // the right number of elements.
-  //
-  // Actually, we can just maxpool only the first `outCh` channels. Let's do that.
-
-  // Down 4: conv 128->64, maxpool first 64ch only, ADD
-  emitDownsample(64, null); // null means no padding, maxpool channels = outCh
-  // Wait, this is wrong. Our maxpool shader pools ALL channels. And the ADD
-  // works on outCh * H * W elements. If maxpool wrote 128ch but we only ADD
-  // 64ch * H * W, we'd be fine because the ADD only reads that many elements.
-  // But the maxpool output buffer has channels 0..127 contiguous in CHW layout,
-  // so the first 64ch are at indices [0, 64*H*W). The ADD would correctly add
-  // these with the conv output's 64ch.
-  //
-  // Actually yes! Since both buffers are in CHW layout:
-  //   conv output [64, 8, 8]: channels 0..63, each 8*8 = 64 values
-  //   maxpool output [128, 8, 8]: channels 0..127, each 8*8 = 64 values
-  //   ADD of first 64*8*8 = 4096 elements picks channels 0..63 from both.
-  // So the ADD naturally truncates the maxpool to the first 64 channels!
-  //
-  // Perfect. So emitDownsample with padCh=null means: maxpool all channels,
-  // ADD only the first outCh * H * H elements. Since the conv output has outCh
-  // channels and the ADD count is outCh * H * H, this works correctly.
-  //
-  // But wait, we need to ensure the maxpool shader runs on the full 128ch input.
-  // Currently emitDownsample passes inCh as the channel count to maxpool.
-  // And ADD uses outCh * H * H elements. This should work!
-
-  // Stage 5: 5 blocks, 128ch, bottleneck 64
-  emitFirstBlock(128, 64, 8);
+  // Down 4 + Stage 5 first block: conv 128→64, maxpool stays 128, project 64→128
+  // No padding needed: maxpool already outputs 128ch = ch
+  emitDownsampleAndFirstBlock(64, 128, null);
+  // After: curCh=128, curH=8
   for (let i = 0; i < 4; i++) {
     emitResBlock(128, 64, 8, true);
   }
 
-  // Down 5: 128->64, no pad
-  emitDownsample(64, null);
-
-  // Stage 6: 5 blocks, 128ch, bottleneck 64
-  emitFirstBlock(128, 64, 4);
+  // Down 5 + Stage 6 first block: same as down 4
+  emitDownsampleAndFirstBlock(64, 128, null);
+  // After: curCh=128, curH=4
   for (let i = 0; i < 4; i++) {
     emitResBlock(128, 64, 4, true);
   }
 
-  // Down 6: 128->64, no pad
-  emitDownsample(64, null);
-
-  // Stage 7: 5 blocks, 128ch, bottleneck 64
-  emitFirstBlock(128, 64, 2);
+  // Down 6 + Stage 7 first block: same as down 4-5
+  emitDownsampleAndFirstBlock(64, 128, null);
+  // After: curCh=128, curH=2
   for (let i = 0; i < 4; i++) {
     emitResBlock(128, 64, 2, true);
   }
@@ -667,9 +573,11 @@ export async function compileLandmarkModel(
   emit(pipeOutConv, bind(L5, [cur, lmConvBuf, lmBiasBuf, bufLM, lmU]),
     [C64(1434), 1, 1]);
 
-  // Presence: conv2d_152 [1, 2, 2, 128] + bias [1]
-  const presConvBuf = uploadF32(fw('conv2d_152', 'Conv2D').data);
-  const presBiasBuf = uploadF32(fw('conv2d_152', 'BiasAdd').data);
+  // Presence: conv2d_151 [1, 2, 2, 128] + bias [1]
+  // NOTE: conv2d_152 (outer wrapper model) gives wrong results — it has a huge bias (47.9)
+  // and produces extreme logits. conv2d_151 (inner model) is the actual presence head.
+  const presConvBuf = uploadF32(fw('conv2d_151', 'Conv2D').data);
+  const presBiasBuf = uploadF32(fw('conv2d_151', 'BiasAdd').data);
   const presU = makeU([128, 1]);
   emit(pipeOutConv, bind(L5, [cur, presConvBuf, presBiasBuf, bufPres, presU]),
     [1, 1, 1]);
@@ -694,15 +602,17 @@ export async function compileLandmarkModel(
     }
     pass.end();
 
-    // Copy results to readback
-    encoder.copyBufferToBuffer(bufLM, 0, readbackBuf, 0, 1434 * 4);
-    encoder.copyBufferToBuffer(bufPresSig, 0, readbackBuf, 1434 * 4, 4);
+    // Copy results to current readback buffer (double-buffered)
+    encoder.copyBufferToBuffer(bufLM, 0, readbackBufs[readbackIdx]!, 0, 1434 * 4);
+    encoder.copyBufferToBuffer(bufPresSig, 0, readbackBufs[readbackIdx]!, 1434 * 4, 4);
   }
 
+  /** Blocking readback — waits for GPU, reads current buffer */
   async function readback(): Promise<LandmarkOutput> {
-    await readbackBuf.mapAsync(GPUMapMode.READ);
-    const data = new Float32Array(readbackBuf.getMappedRange().slice(0));
-    readbackBuf.unmap();
+    const buf = readbackBufs[readbackIdx]!;
+    await buf.mapAsync(GPUMapMode.READ);
+    const data = new Float32Array(buf.getMappedRange().slice(0));
+    buf.unmap();
 
     return {
       landmarks: data.subarray(0, 1434),
@@ -710,10 +620,31 @@ export async function compileLandmarkModel(
     };
   }
 
+  /** Non-blocking readback — starts mapAsync on current buffer, returns promise.
+   *  The promise resolves when GPU finishes and data is available. */
+  function beginReadback(): Promise<LandmarkOutput> {
+    const buf = readbackBufs[readbackIdx]!;
+    return buf.mapAsync(GPUMapMode.READ).then(() => {
+      const data = new Float32Array(buf.getMappedRange().slice(0));
+      buf.unmap();
+      return {
+        landmarks: data.subarray(0, 1434),
+        score: data[1434]!,
+      };
+    });
+  }
+
+  /** Flip to the other readback buffer for the next frame */
+  function flipReadbackBuffer(): void {
+    readbackIdx = 1 - readbackIdx;
+  }
+
   return {
     device,
     run,
     readback,
+    beginReadback,
+    flipReadbackBuffer,
     inputBufferSize: INPUT_BYTES,
   };
 }

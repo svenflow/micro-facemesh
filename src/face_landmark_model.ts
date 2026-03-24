@@ -28,7 +28,7 @@ export interface WeightsMetadata {
 export interface FaceLandmarksOutput {
   /** 478 landmarks x 3 (x, y, z) = 1434 values, normalized to [0,1] in crop space */
   landmarks: Float32Array;
-  /** Face presence score (1 value, raw — apply sigmoid externally) */
+  /** Face presence score (1 value, already sigmoid'd, 0-1 range) */
   facePresence: Float32Array;
 }
 
@@ -37,6 +37,14 @@ export interface CompiledFaceLandmarkModel {
   run: (input: Float32Array) => Promise<FaceLandmarksOutput>;
   runFromCanvas: (source: HTMLCanvasElement | OffscreenCanvas | ImageBitmap) => Promise<FaceLandmarksOutput>;
   runFromGPUBuffer: (inputBuffer: GPUBuffer) => Promise<FaceLandmarksOutput>;
+  /** Encode landmark inference into an existing command encoder (no submit). */
+  encodeFromGPUBuffer: (inputBuffer: GPUBuffer, encoder: GPUCommandEncoder) => void;
+  /** Read back results after submitting an encoder that called encodeFromGPUBuffer (blocking). */
+  readbackLandmarks: () => Promise<FaceLandmarksOutput>;
+  /** Begin non-blocking readback. Returns promise that resolves when GPU finishes. */
+  beginReadbackLandmarks: () => Promise<FaceLandmarksOutput>;
+  /** Flip to the other readback buffer (for double-buffered pipelining). */
+  flipReadbackBuffer: () => void;
 }
 
 /**
@@ -126,6 +134,17 @@ export async function compileFaceLandmarkModel(
 
   const compiled = await compileLandmarkModel(device, lmWeights);
 
+  /** Normalize raw landmark output from pixel coordinates (0-256) to [0,1] */
+  function normalizeLandmarks(raw: Float32Array): Float32Array {
+    const normalized = new Float32Array(raw.length);
+    for (let i = 0; i < raw.length; i += 3) {
+      normalized[i] = raw[i]! / 256;     // x
+      normalized[i + 1] = raw[i + 1]! / 256; // y
+      normalized[i + 2] = raw[i + 2]! / 256; // z (also normalize for consistency)
+    }
+    return normalized;
+  }
+
   async function runFromFloat32(input: Float32Array): Promise<FaceLandmarksOutput> {
     const inputBuf = device.createBuffer({
       size: input.byteLength,
@@ -143,7 +162,7 @@ export async function compileFaceLandmarkModel(
     inputBuf.destroy();
 
     return {
-      landmarks: result.landmarks,
+      landmarks: normalizeLandmarks(result.landmarks),
       facePresence: new Float32Array([result.score]),
     };
   }
@@ -155,9 +174,36 @@ export async function compileFaceLandmarkModel(
 
     const result = await compiled.readback();
     return {
-      landmarks: result.landmarks,
+      landmarks: normalizeLandmarks(result.landmarks),
       facePresence: new Float32Array([result.score]),
     };
+  }
+
+  /** Encode landmark inference into an existing command encoder (caller submits). */
+  function encodeFromGPUBuffer(inputBuffer: GPUBuffer, encoder: GPUCommandEncoder): void {
+    compiled.run(inputBuffer, encoder);
+  }
+
+  /** Read back results after an encoder containing encodeFromGPUBuffer has been submitted (blocking). */
+  async function readbackLandmarks(): Promise<FaceLandmarksOutput> {
+    const result = await compiled.readback();
+    return {
+      landmarks: normalizeLandmarks(result.landmarks),
+      facePresence: new Float32Array([result.score]),
+    };
+  }
+
+  /** Begin non-blocking readback — returns promise that resolves when GPU finishes. */
+  function beginReadbackLandmarks(): Promise<FaceLandmarksOutput> {
+    return compiled.beginReadback().then(result => ({
+      landmarks: normalizeLandmarks(result.landmarks),
+      facePresence: new Float32Array([result.score]),
+    }));
+  }
+
+  /** Flip readback buffer for double-buffered pipelining. */
+  function flipReadbackBuffer(): void {
+    compiled.flipReadbackBuffer();
   }
 
   async function runFromCanvas(source: HTMLCanvasElement | OffscreenCanvas | ImageBitmap): Promise<FaceLandmarksOutput> {
@@ -187,5 +233,9 @@ export async function compileFaceLandmarkModel(
     run: runFromFloat32,
     runFromCanvas,
     runFromGPUBuffer,
+    encodeFromGPUBuffer,
+    readbackLandmarks,
+    beginReadbackLandmarks,
+    flipReadbackBuffer,
   };
 }

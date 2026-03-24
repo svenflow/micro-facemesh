@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>micro-facemesh — Performance Benchmark</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0a0a0a; color: #ededed; font-family: 'SF Mono', 'Menlo', monospace; padding: 16px; font-size: 13px; }
+    h2 { font-family: system-ui; margin-bottom: 8px; font-size: 18px; }
+    .row { display: flex; gap: 4px; align-items: baseline; padding: 2px 0; }
+    .label { color: #888; min-width: 240px; }
+    .val { font-weight: 600; }
+    .ok { color: #34d399; }
+    .err { color: #ef4444; }
+    .warn { color: #fbbf24; }
+    .num { color: #60a5fa; }
+    hr { border: none; border-top: 1px solid #222; margin: 8px 0; }
+    #log { line-height: 1.5; }
+    .section { margin: 10px 0 4px 0; font-weight: 700; font-size: 14px; color: #7c6aef; }
+    .error-box { background: #1a0505; border: 1px solid #ef4444; padding: 8px; border-radius: 4px; margin: 8px 0; white-space: pre-wrap; font-size: 12px; }
+    table { border-collapse: collapse; margin: 8px 0; }
+    th, td { text-align: right; padding: 4px 12px; border-bottom: 1px solid #222; font-size: 12px; }
+    th { color: #888; font-weight: 400; }
+    td.name { text-align: left; color: #aaa; }
+    .best { color: #34d399; font-weight: 700; }
+    video, canvas { display: none; }
+    .mode-toggle { display: flex; gap: 8px; margin-bottom: 12px; }
+    .mode-btn { background: #141414; border: 1px solid #333; border-radius: 6px; padding: 6px 12px; color: #aaa; cursor: pointer; font-family: inherit; font-size: 12px; }
+    .mode-btn.active { border-color: #7c6aef; color: #7c6aef; }
+  </style>
+</head>
+<body>
+  <h2>Performance Benchmark ⚡</h2>
+  <p style="color: #888; margin-bottom: 12px; font-family: system-ui; font-size: 13px;">
+    Measures micro-facemesh vs MediaPipe (GPU + WASM) — warmup 10, bench 50 frames.
+  </p>
+  <div class="mode-toggle">
+    <button class="mode-btn active" onclick="runBenchmark('camera')">📷 Camera</button>
+    <button class="mode-btn" onclick="runBenchmark('image')">🖼️ Static Image</button>
+  </div>
+  <div id="log"></div>
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="inputCanvas"></canvas>
+  <canvas id="faceCanvas" width="640" height="480"></canvas>
+
+  <script type="module">
+    const log = document.getElementById('log');
+    function div(cls, html) {
+      const d = document.createElement('div');
+      d.className = cls;
+      d.innerHTML = html;
+      log.appendChild(d);
+      window.scrollTo(0, document.body.scrollHeight);
+      return d;
+    }
+    function row(label, value, cls = '') {
+      div('row', `<span class="label">${label}</span><span class="val ${cls}">${value}</span>`);
+    }
+    function section(title) { div('section', title); }
+    function hr_() { log.appendChild(document.createElement('hr')); }
+
+    const WARMUP = 10;
+    const BENCH = 50;
+
+    // Generate a synthetic face-like image for consistent benchmarking
+    function generateFaceImage() {
+      const c = document.getElementById('faceCanvas');
+      c.width = 640; c.height = 480;
+      const ctx = c.getContext('2d');
+      // Skin-tone background
+      ctx.fillStyle = '#d4a574';
+      ctx.fillRect(0, 0, 640, 480);
+      // Face oval
+      ctx.fillStyle = '#c9956b';
+      ctx.beginPath();
+      ctx.ellipse(320, 240, 120, 160, 0, 0, Math.PI * 2);
+      ctx.fill();
+      // Darker skin for features
+      ctx.fillStyle = '#8B6914';
+      // Left eye
+      ctx.beginPath();
+      ctx.ellipse(280, 210, 20, 10, 0, 0, Math.PI * 2);
+      ctx.fill();
+      // Right eye
+      ctx.beginPath();
+      ctx.ellipse(360, 210, 20, 10, 0, 0, Math.PI * 2);
+      ctx.fill();
+      // Nose
+      ctx.beginPath();
+      ctx.moveTo(320, 230);
+      ctx.lineTo(310, 270);
+      ctx.lineTo(330, 270);
+      ctx.closePath();
+      ctx.fill();
+      // Mouth
+      ctx.fillStyle = '#8B4513';
+      ctx.beginPath();
+      ctx.ellipse(320, 300, 30, 12, 0, 0, Math.PI * 2);
+      ctx.fill();
+      // Hair
+      ctx.fillStyle = '#2a1a0a';
+      ctx.beginPath();
+      ctx.ellipse(320, 130, 140, 80, 0, Math.PI, Math.PI * 2);
+      ctx.fill();
+      return c;
+    }
+
+    function stats(times) {
+      times.sort((a, b) => a - b);
+      return {
+        median: times[Math.floor(times.length / 2)],
+        p95: times[Math.floor(times.length * 0.95)],
+        mean: times.reduce((a, b) => a + b) / times.length,
+        min: times[0],
+        max: times[times.length - 1],
+        times,
+      };
+    }
+
+    async function benchmarkMicro(getSource) {
+      const { createFacemesh } = await import('./dist/index.js');
+      const t0load = performance.now();
+      const fm = await createFacemesh({
+        weightsUrl: './weights',
+        scoreThreshold: 0.5,
+        faceScoreThreshold: 0.3,
+      });
+      row('Model load', (performance.now() - t0load).toFixed(0) + 'ms', 'num');
+
+      // Warmup — pass source directly (no canvas copy needed)
+      for (let i = 0; i < WARMUP; i++) {
+        const src = await getSource();
+        await fm.detect(src);
+      }
+      row('Warmup', `${WARMUP} frames`, 'ok');
+
+      // Benchmark
+      const times = [];
+      let detected = 0;
+      for (let i = 0; i < BENCH; i++) {
+        const src = await getSource();
+        const t0 = performance.now();
+        const faces = await fm.detect(src);
+        times.push(performance.now() - t0);
+        if (faces.length > 0) detected++;
+      }
+
+      const s = stats(times);
+      row('Frames', `${BENCH}`, 'num');
+      row('Detected', `${detected}/${BENCH}`, detected > 0 ? 'ok' : 'warn');
+      row('Median', s.median.toFixed(1) + 'ms', 'ok');
+      row('Mean', s.mean.toFixed(1) + 'ms', 'num');
+      row('P95', s.p95.toFixed(1) + 'ms', 'warn');
+      row('Min / Max', `${s.min.toFixed(1)} / ${s.max.toFixed(1)} ms`, 'num');
+      row('Est. FPS', Math.round(1000 / s.median), 'ok');
+      return s;
+    }
+
+    async function benchmarkMediaPipe(delegate, getVideoSource) {
+      const { FilesetResolver, FaceLandmarker } = await import(
+        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/+esm'
+      );
+      const vision = await FilesetResolver.forVisionTasks(
+        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm'
+      );
+      const t0load = performance.now();
+      const mp = await FaceLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+          delegate,
+        },
+        runningMode: 'VIDEO',
+        numFaces: 1,
+        outputFaceBlendshapes: false,
+        outputFacialTransformationMatrixes: false,
+      });
+      row('Model load', (performance.now() - t0load).toFixed(0) + 'ms', 'num');
+
+      let ts = 0;
+      // Warmup
+      for (let i = 0; i < WARMUP; i++) {
+        ts += 33;
+        const src = await getVideoSource();
+        mp.detectForVideo(src, ts);
+      }
+      row('Warmup', `${WARMUP} frames`, 'ok');
+
+      // Benchmark
+      const times = [];
+      let detected = 0;
+      for (let i = 0; i < BENCH; i++) {
+        ts += 33;
+        const src = await getVideoSource();
+        const t0 = performance.now();
+        const r = mp.detectForVideo(src, ts);
+        times.push(performance.now() - t0);
+        if (r?.faceLandmarks?.length > 0) detected++;
+      }
+
+      const s = stats(times);
+      row('Frames', `${BENCH}`, 'num');
+      row('Detected', `${detected}/${BENCH}`, detected > 0 ? 'ok' : 'warn');
+      row('Median', s.median.toFixed(1) + 'ms', 'ok');
+      row('Mean', s.mean.toFixed(1) + 'ms', 'num');
+      row('P95', s.p95.toFixed(1) + 'ms', 'warn');
+      row('Min / Max', `${s.min.toFixed(1)} / ${s.max.toFixed(1)} ms`, 'num');
+      row('Est. FPS', Math.round(1000 / s.median), 'ok');
+      mp.close();
+      return s;
+    }
+
+    window.runBenchmark = async function(mode) {
+      log.innerHTML = '';
+      document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+      document.querySelector(`.mode-btn[onclick*="${mode}"]`)?.classList.add('active');
+
+      section('SYSTEM');
+      row('WebGPU', navigator.gpu ? 'YES' : 'NO', navigator.gpu ? 'ok' : 'err');
+      row('Mode', mode === 'camera' ? '📷 Camera' : '🖼️ Static Image', 'num');
+      row('User Agent', navigator.userAgent.slice(0, 80));
+
+      let getSource, getVideoSource;
+
+      if (mode === 'camera') {
+        section('CAMERA');
+        const video = document.getElementById('video');
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }
+        });
+        video.srcObject = stream;
+        await video.play();
+        const bmp = await createImageBitmap(video);
+        const vw = bmp.width, vh = bmp.height;
+        bmp.close();
+        row('Resolution', `${vw}×${vh}`, 'num');
+        await new Promise(r => setTimeout(r, 500));
+
+        getSource = () => video;
+        getVideoSource = () => video;
+      } else {
+        section('IMAGE');
+        const faceCanvas = generateFaceImage();
+        row('Generated', '640×480 synthetic face', 'ok');
+        getSource = () => faceCanvas;
+        getVideoSource = () => faceCanvas;
+      }
+
+      let microR = null, gpuR = null, wasmR = null;
+
+      // ======== MICRO-FACEMESH ========
+      if (navigator.gpu) {
+        hr_();
+        section('MICRO-FACEMESH (WebGPU)');
+        try {
+          microR = await benchmarkMicro(async () => await getSource());
+        } catch (e) {
+          div('error-box', `micro-facemesh: ${e.message}\n${e.stack}`);
+        }
+      }
+
+      // ======== MEDIAPIPE GPU ========
+      hr_();
+      section('MEDIAPIPE GPU (WebGL)');
+      try {
+        gpuR = await benchmarkMediaPipe('GPU', async () => await getVideoSource());
+      } catch (e) {
+        div('error-box', `MediaPipe GPU: ${e.message}\n${e.stack}`);
+      }
+
+      // ======== MEDIAPIPE WASM ========
+      hr_();
+      section('MEDIAPIPE WASM (CPU)');
+      try {
+        wasmR = await benchmarkMediaPipe('CPU', async () => await getVideoSource());
+      } catch (e) {
+        div('error-box', `MediaPipe WASM: ${e.message}\n${e.stack}`);
+      }
+
+      // ======== SUMMARY TABLE ========
+      hr_();
+      section('SUMMARY');
+      let html = '<table><tr><th></th><th>Median</th><th>Mean</th><th>P95</th><th>Min</th><th>Max</th><th>Est FPS</th></tr>';
+      const medians = [microR?.median, gpuR?.median, wasmR?.median].filter(x => x != null);
+      const best = Math.min(...medians);
+
+      function addRow(name, r) {
+        if (!r) { html += `<tr><td class="name">${name}</td><td colspan="6" style="color:#ef4444">FAILED</td></tr>`; return; }
+        const mCls = r.median === best ? ' class="best"' : '';
+        html += `<tr><td class="name">${name}</td>` +
+          `<td${mCls}>${r.median.toFixed(1)}ms</td>` +
+          `<td>${r.mean.toFixed(1)}ms</td>` +
+          `<td>${r.p95.toFixed(1)}ms</td>` +
+          `<td>${r.min.toFixed(1)}ms</td>` +
+          `<td>${r.max.toFixed(1)}ms</td>` +
+          `<td>${Math.round(1000/r.median)}</td></tr>`;
+      }
+      addRow('micro-facemesh', microR);
+      addRow('MediaPipe GPU', gpuR);
+      addRow('MediaPipe WASM', wasmR);
+      html += '</table>';
+      div('', html);
+
+      if (microR && gpuR) {
+        const ratio = (microR.median / gpuR.median).toFixed(2);
+        const faster = microR.median < gpuR.median;
+        row('micro vs MP-GPU', `${ratio}x (micro is ${faster ? 'FASTER' : 'SLOWER'})`, faster ? 'ok' : 'err');
+      }
+
+      section('DONE ✅');
+    };
+
+    // Auto-run: use URL param ?mode=image, or try camera with fallback to image
+    const urlMode = new URLSearchParams(location.search).get('mode');
+    if (urlMode === 'image') {
+      window.runBenchmark('image').catch(e => div('error-box', `Fatal: ${e.message}\n${e.stack}`));
+    } else {
+      window.runBenchmark('camera').catch(async () => {
+        // Camera failed, auto-fallback to static image
+        log.innerHTML = '';
+        await window.runBenchmark('image').catch(e => div('error-box', `Fatal: ${e.message}\n${e.stack}`));
+      });
+    }
+  </script>
+</body>
+</html>

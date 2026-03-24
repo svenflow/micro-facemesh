@@ -1,4 +1,4 @@
-function P(n){return n.replace(/\/\/[^\n]*/g,"").replace(/\s+/g," ").replace(/\s*([{}();,=+\-*/<>!&|@])\s*/g,"$1").trim()}var vr=P(`
+function x(i){return i.replace(/\/\/[^\n]*/g,"").replace(/\s+/g," ").replace(/\s*([{}();,=+\-*/<>!&|@])\s*/g,"$1").trim()}var ha=x(`
 struct Params { in_channels:u32, out_channels:u32, in_h:u32, in_w:u32, out_h:u32, out_w:u32, }
 @group(0)@binding(0) var<storage,read> input:array<f32>;
 @group(0)@binding(1) var<storage,read> weight:array<f32>;
@@ -19,7 +19,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         let ix=i32(out_x*2u+kx);
         if(iy>=0 && iy<in_h && ix>=0 && ix<in_w){
           let in_idx=ic*params.in_h*params.in_w+u32(iy)*params.in_w+u32(ix);
-          let w_idx=oc*params.in_channels*9u+ic*9u+ky*3u+kx;
+          let w_idx=oc*9u*params.in_channels+ky*3u*params.in_channels+kx*params.in_channels+ic;
           sum+=input[in_idx]*weight[w_idx];
         }
       }
@@ -31,7 +31,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   let out_idx=oc*params.out_h*params.out_w+out_y*params.out_w+out_x;
   output[out_idx]=sum;
 }
-`),hr=P(`
+`),va=x(`
 struct Params { in_channels:u32, out_channels:u32, height:u32, width:u32, }
 @group(0)@binding(0) var<storage,read> input:array<f32>;
 @group(0)@binding(1) var<storage,read> weight:array<f32>;
@@ -53,7 +53,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   if(sum<0.0){ sum=sum*alpha[oc]; }
   output[oc*spatial+pix]=sum;
 }
-`),Pr=P(`
+`),Pa=x(`
 struct Params { channels:u32, in_h:u32, in_w:u32, out_h:u32, out_w:u32, stride:u32, pad:u32, }
 @group(0)@binding(0) var<storage,read> input:array<f32>;
 @group(0)@binding(1) var<storage,read> weight:array<f32>;
@@ -84,7 +84,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   sum+=bias[c];
   output[c*params.out_h*params.out_w+out_y*params.out_w+out_x]=sum;
 }
-`),kr=P(`
+`),ka=x(`
 struct Params { in_channels:u32, out_channels:u32, height:u32, width:u32, }
 @group(0)@binding(0) var<storage,read> input:array<f32>;
 @group(0)@binding(1) var<storage,read> weight:array<f32>;
@@ -104,7 +104,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   sum+=bias[oc];
   output[oc*spatial+pix]=sum;
 }
-`),Ur=P(`
+`),Ua=x(`
 @group(0)@binding(0) var<storage,read> a:array<f32>;
 @group(0)@binding(1) var<storage,read> b:array<f32>;
 @group(0)@binding(2) var<storage,read_write> output:array<f32>;
@@ -115,7 +115,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   if(idx>=count){return;}
   output[idx]=a[idx]+b[idx];
 }
-`),Br=P(`
+`),Ba=x(`
 struct Params { in_channels:u32, out_channels:u32, in_h:u32, in_w:u32, out_h:u32, out_w:u32, }
 @group(0)@binding(0) var<storage,read> input:array<f32>;
 @group(0)@binding(1) var<storage,read> weight:array<f32>;
@@ -135,7 +135,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         let ix=out_x*2u+kx;
         if(iy<in_h && ix<in_w){
           let in_idx=ic*in_h*in_w+iy*in_w+ix;
-          let w_idx=oc*params.in_channels*4u+ic*4u+ky*2u+kx;
+          let w_idx=oc*4u*params.in_channels+ky*2u*params.in_channels+kx*params.in_channels+ic;
           sum+=input[in_idx]*weight[w_idx];
         }
       }
@@ -144,7 +144,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   sum+=bias[oc];
   output[oc*params.out_h*params.out_w+out_y*params.out_w+out_x]=sum;
 }
-`),Lr=P(`
+`),La=x(`
 struct Params { channels:u32, in_h:u32, in_w:u32, out_h:u32, out_w:u32, }
 @group(0)@binding(0) var<storage,read> input:array<f32>;
 @group(0)@binding(1) var<storage,read_write> output:array<f32>;
@@ -168,7 +168,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   }
   output[c*params.out_h*params.out_w+out_y*params.out_w+out_x]=mx;
 }
-`),Ar=P(`
+`),Aa=x(`
 struct Params { in_channels:u32, out_channels:u32, height:u32, width:u32, }
 @group(0)@binding(0) var<storage,read> input:array<f32>;
 @group(0)@binding(1) var<storage,read_write> output:array<f32>;
@@ -185,7 +185,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   }
   output[oc*spatial+pix]=val;
 }
-`),Gr=P(`
+`),Da=x(`
 struct Params { in_channels:u32, out_channels:u32, }
 @group(0)@binding(0) var<storage,read> input:array<f32>;
 @group(0)@binding(1) var<storage,read> weight:array<f32>;
@@ -201,7 +201,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     for(var ky:u32=0u;ky<2u;ky++){
       for(var kx:u32=0u;kx<2u;kx++){
         let in_idx=ic*4u+ky*2u+kx;
-        let w_idx=oc*params.in_channels*4u+ic*4u+ky*2u+kx;
+        let w_idx=oc*4u*params.in_channels+ky*2u*params.in_channels+kx*params.in_channels+ic;
         sum+=input[in_idx]*weight[w_idx];
       }
     }
@@ -209,7 +209,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   sum+=bias[oc];
   output[oc]=sum;
 }
-`),Mr=P(`
+`),Ga=x(`
 @group(0)@binding(0) var<storage,read> input:array<f32>;
 @group(0)@binding(1) var<storage,read_write> output:array<f32>;
 @group(0)@binding(2) var<uniform> count:u32;
@@ -219,7 +219,23 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   if(idx>=count){return;}
   output[idx]=1.0/(1.0+exp(-input[idx]));
 }
-`),Cr=P(`
+`),Ma=x(`
+struct Params { channels:u32, height:u32, width:u32, }
+@group(0)@binding(0) var<storage,read> a:array<f32>;
+@group(0)@binding(1) var<storage,read> b:array<f32>;
+@group(0)@binding(2) var<storage,read> alpha:array<f32>;
+@group(0)@binding(3) var<storage,read_write> output:array<f32>;
+@group(0)@binding(4) var<uniform> params:Params;
+@compute @workgroup_size(8,8,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>){
+  let x=gid.x; let y=gid.y; let c=gid.z;
+  if(x>=params.width||y>=params.height||c>=params.channels){return;}
+  let idx=c*params.height*params.width+y*params.width+x;
+  var val=a[idx]+b[idx];
+  if(val<0.0){ val=val*alpha[c]; }
+  output[idx]=val;
+}
+`),Ra=x(`
 struct Params { channels:u32, height:u32, width:u32, }
 @group(0)@binding(0) var<storage,read> input:array<f32>;
 @group(0)@binding(1) var<storage,read> alpha:array<f32>;
@@ -237,4 +253,4 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     output[idx]=val;
   }
 }
-`);async function pa(n){let[u,e]=await Promise.all([fetch(`${n}/face_landmarks_weights.json`),fetch(`${n}/face_landmarks_weights.bin`)]);if(!u.ok)throw new Error(`Failed to load landmark metadata: ${u.status}`);if(!e.ok)throw new Error(`Failed to load landmark weights: ${e.status}`);let i=await u.json(),_=await e.arrayBuffer();return na(i,_)}function na(n,u){let e=new Map,i=n.dtype??"float32";for(let _=0;_<n.keys.length;_++){let g=n.keys[_],k=n.shapes[_],l=n.offsets[_],y=k.reduce((d,U)=>d*U,1),M;if(i==="float32")M=new Float32Array(u,l,y);else{let d=new DataView(u);M=new Float32Array(y);for(let U=0;U<y;U++)M[U]=ia(d.getUint16(l+U*2,!0))}e.set(g,{data:M,shape:k})}return e}function ia(n){let u=n>>15&1,e=n>>10&31,i=n&1023;return e===0?i===0?u?-0:0:(u?-1:1)*Math.pow(2,-14)*(i/1024):e===31?i===0?u?-1/0:1/0:NaN:(u?-1:1)*Math.pow(2,e-15)*(1+i/1024)}function oa(n,u,...e){let i=u.find(_=>e.every(g=>_.includes(g)));if(!i)throw new Error(`Weight not found for: ${e.join(", ")}`);return n.get(i)}function ea(n){let[,u,e,i]=n.shape,_=u*e,g=new Float32Array(i*_);for(let k=0;k<i;k++)for(let l=0;l<u;l++)for(let y=0;y<e;y++)g[k*_+l*e+y]=n.data[l*e*i+y*i+k];return g}async function ca(n,u){let e=Array.from(u.keys());function i(...r){return oa(u,e,...r)}let _={r:"read-only-storage",s:"storage",u:"uniform"};function g(r){return n.createBindGroupLayout({entries:r.map((t,a)=>({binding:a,visibility:GPUShaderStage.COMPUTE,buffer:{type:_[t]}}))})}let k=GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,l=GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST,y=GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,M=GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST;function d(r,t){return n.createBuffer({size:Math.max(r,4),usage:t})}function U(r,t){n.queue.writeBuffer(r,0,t)}function w(r){let t=d(r.byteLength,k);return U(t,r),t}function v(r,t){return n.createComputePipeline({layout:n.createPipelineLayout({bindGroupLayouts:[r]}),compute:{module:n.createShaderModule({code:t}),entryPoint:"main"}})}function s(r,t){return n.createBindGroup({layout:r,entries:t.map((a,f)=>({binding:f,resource:{buffer:a}}))})}let V=g(["r","r","r","r","s","u"]),h=g(["r","r","r","s","u"]),Z=g(["r","r","s","u"]),rr=g(["r","s","u"]),ar=g(["r","s","u"]),O=g(["r","r","s","u"]),tr=g(["r","s","u"]),Sr=v(V,vr),Dr=v(V,hr),nr=v(h,Pr),ir=v(h,kr),or=v(Z,Ur),Er=v(h,Br),Rr=v(rr,Lr),Or=v(ar,Ar),er=v(h,Gr),Tr=v(tr,Mr),$=v(O,Cr),T=16384*128*4,q=d(T,l),ur=d(T,l),Hr=d(T,l),Nr=d(T,l),zr=d(T,l),sr=d(1434*4,y),pr=d(4,y),cr=d(4,y),H=d(1435*4,GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST),dr=132,fr=126,_r=82,J=60;function gr(){let r=i(`batch_normalization_${dr}`);return dr++,w(r.data)}function mr(){let r=i(`p_re_lu_${fr}`);return fr++,w(r.data)}function j(){let r=i(`conv2d_${_r}`,"Conv2D");return _r++,{buf:w(r.data),shape:r.shape}}function lr(){let r;try{r=i(`depthwise_conv2d_${J}/depthwise`)}catch{r=i(`depthwise_conv2d_${J}/depthwise1`)}return J++,w(ea(r))}function I(){return{bn:gr(),prelu:mr()}}let yr=[];function p(r,t,a){yr.push({pipe:r,bg:t,wg:a})}let o=r=>Math.ceil(r/8),Fr=r=>Math.ceil(r/64),xr=r=>Math.ceil(r/256);function c(r){let t=d(r.length*4,M);return U(t,new Uint32Array(r)),t}let Xr=w(i("conv2d_81","Conv2D").data),Wr=gr(),Vr=mr(),$r=c([3,16,256,256,128,128]);p(Sr,s(V,[q,Xr,Wr,Vr,ur,$r]),[o(128),o(128),16]);let m=ur,B=16,C=128,[x,b,N,br]=[Hr,Nr,zr,q];function L(r,t,a,f){let z=j(),A=I(),F=c([r,t,a,a]);p(Dr,s(V,[m,z.buf,A.bn,A.prelu,x,F]),[o(a),o(a),t]);let E=lr(),G=w(new Float32Array(t)),R=c([t,a,a,a,a,1,1]);p(nr,s(h,[x,E,G,b,R]),[o(a),o(a),t]);let X=j(),W=I(),K=c([t,r,a,a]);if(p(ir,s(h,[b,X.buf,W.bn,x,K]),[o(a),o(a),r]),f){let Y=r*a*a,Q=c([Y]);p(or,s(Z,[x,m,b,Q]),[xr(Y),1,1]);let aa=c([r,a,a]);p($,s(O,[b,W.prelu,N,aa]),[o(a),o(a),r]);let ta=m;m=N,N=ta}else{let Y=c([r,a,a]);p($,s(O,[x,W.prelu,b,Y]),[o(a),o(a),r]);let Q=m;m=b,b=Q}B=r}function S(r,t,a){let f=lr(),z=w(new Float32Array(B)),A=c([B,a,a,a,a,1,1]);p(nr,s(h,[m,f,z,x,A]),[o(a),o(a),B]);let F=j(),E=I(),G=c([B,r,a,a]);p(ir,s(h,[x,F.buf,E.bn,b,G]),[o(a),o(a),r]);let R=c([r,a,a]);p($,s(O,[b,E.prelu,x,R]),[o(a),o(a),r]);let X=m;m=x,x=X,B=r}function D(r,t){let a=C/2,f=B,z=j(),A=I(),F=c([f,r,C,C,a,a]);p(Er,s(h,[m,z.buf,A.bn,x,F]),[o(a),o(a),r]);let E=c([f,C,C,a,a]);p(Rr,s(rr,[m,b,E]),[o(a),o(a),f]);let G;if(t!==null&&t>f){let K=c([f,t,a,a]);p(Or,s(ar,[b,N,K]),[o(a),o(a),t]),G=N}else G=b;let R=r*a*a,X=c([R]);p(or,s(Z,[x,G,br,X]),[xr(R),1,1]);let W=c([r,a,a]);p($,s(O,[br,A.prelu,m,W]),[o(a),o(a),r]),B=r,C=a}for(let r=0;r<4;r++)L(16,8,128,!0);D(16,32),S(32,16,64);for(let r=0;r<4;r++)L(32,16,64,!0);D(32,64),S(64,32,32);for(let r=0;r<4;r++)L(64,32,32,!0);D(64,128),S(128,64,16);for(let r=0;r<4;r++)L(128,64,16,!0);D(64,null),S(128,64,8);for(let r=0;r<4;r++)L(128,64,8,!0);D(64,null),S(128,64,4);for(let r=0;r<4;r++)L(128,64,4,!0);D(64,null),S(128,64,2);for(let r=0;r<4;r++)L(128,64,2,!0);let jr=w(i("conv2d_150","Conv2D").data),Ir=w(i("conv2d_150","BiasAdd").data),Yr=c([128,1434]);p(er,s(h,[m,jr,Ir,sr,Yr]),[Fr(1434),1,1]);let Zr=w(i("conv2d_152","Conv2D").data),qr=w(i("conv2d_152","BiasAdd").data),Jr=c([128,1]);p(er,s(h,[m,Zr,qr,pr,Jr]),[1,1,1]);let Kr=c([1]);p(Tr,s(tr,[pr,cr,Kr]),[1,1,1]);let wr=3*256*256*4;function Qr(r,t){t.copyBufferToBuffer(r,0,q,0,wr);let a=t.beginComputePass();for(let f of yr)a.setPipeline(f.pipe),a.setBindGroup(0,f.bg),a.dispatchWorkgroups(...f.wg);a.end(),t.copyBufferToBuffer(sr,0,H,0,1434*4),t.copyBufferToBuffer(cr,0,H,1434*4,4)}async function ra(){await H.mapAsync(GPUMapMode.READ);let r=new Float32Array(H.getMappedRange().slice(0));return H.unmap(),{landmarks:r.subarray(0,1434),score:r[1434]}}return{device:n,run:Qr,readback:ra,inputBufferSize:wr}}export{ca as compileLandmarkModel,pa as loadLandmarkWeights,na as loadLandmarkWeightsFromBuffer};
+`);async function mr(i){let[s,u]=await Promise.all([fetch(`${i}/face_landmarks_weights.json`),fetch(`${i}/face_landmarks_weights.bin`)]);if(!s.ok)throw new Error(`Failed to load landmark metadata: ${s.status}`);if(!u.ok)throw new Error(`Failed to load landmark weights: ${u.status}`);let e=await s.json(),g=await u.arrayBuffer();return sr(e,g)}function sr(i,s){let u=new Map,e=i.dtype??"float32";for(let g=0;g<i.keys.length;g++){let _=i.keys[g],v=i.shapes[g],l=i.offsets[g],y=v.reduce((p,P)=>p*P,1),A;if(e==="float32")A=new Float32Array(s,l,y);else{let p=new DataView(s);A=new Float32Array(y);for(let P=0;P<y;P++)A[P]=pr(p.getUint16(l+P*2,!0))}u.set(_,{data:A,shape:v})}return u}function pr(i){let s=i>>15&1,u=i>>10&31,e=i&1023;return u===0?e===0?s?-0:0:(s?-1:1)*Math.pow(2,-14)*(e/1024):u===31?e===0?s?-1/0:1/0:NaN:(s?-1:1)*Math.pow(2,u-15)*(1+e/1024)}function cr(i,s,...u){let e=s.find(g=>u.every(_=>g.includes(_)));if(!e)throw new Error(`Weight not found for: ${u.join(", ")}`);return i.get(e)}function dr(i){let[,s,u,e]=i.shape,g=s*u,_=new Float32Array(e*g);for(let v=0;v<e;v++)for(let l=0;l<s;l++)for(let y=0;y<u;y++)_[v*g+l*u+y]=i.data[l*u*e+y*e+v];return _}async function yr(i,s){let u=Array.from(s.keys());function e(...a){return cr(s,u,...a)}let g={r:"read-only-storage",s:"storage",u:"uniform"};function _(a){return i.createBindGroupLayout({entries:a.map((r,n)=>({binding:n,visibility:GPUShaderStage.COMPUTE,buffer:{type:g[r]}}))})}let v=GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,l=GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST,y=GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,A=GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST;function p(a,r){return i.createBuffer({size:Math.max(a,4),usage:r})}function P(a,r){i.queue.writeBuffer(a,0,r)}function w(a){let r=p(a.byteLength,v);return P(r,a),r}function b(a,r){return i.createComputePipeline({layout:i.createPipelineLayout({bindGroupLayouts:[a]}),compute:{module:i.createShaderModule({code:r}),entryPoint:"main"}})}function c(a,r){return i.createBindGroup({layout:a,entries:r.map((n,t)=>({binding:t,resource:{buffer:n}}))})}let H=_(["r","r","r","r","s","u"]),h=_(["r","r","r","s","u"]),Sa=_(["r","r","s","u"]),Q=_(["r","s","u"]),aa=_(["r","s","u"]),V=_(["r","r","s","u"]),I=_(["r","r","r","s","u"]),ra=_(["r","s","u"]),Ea=b(H,ha),Ca=b(H,va),ta=b(h,Pa),na=b(h,ka),fr=b(Sa,Ua),Oa=b(h,Ba),Ta=b(Q,La),Ha=b(aa,Aa),ia=b(h,Da),za=b(ra,Ga),ea=b(V,Ra),oa=b(I,Ma),R=16384*128*4,$=p(R,l),ua=p(R,l),Na=p(R,l),Fa=p(R,l),Xa=p(R,l),sa=p(1434*4,y),pa=p(4,y),ca=p(4,y),z=[p(1435*4,GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST),p(1435*4,GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST)],D=0,da=132,fa=126,_a=82,j=60;function ga(){let a=e(`batch_normalization_${da}`);return da++,w(a.data)}function la(){let a=e(`p_re_lu_${fa}`);return fa++,w(a.data)}function N(){let a=e(`conv2d_${_a}`,"Conv2D");return _a++,{buf:w(a.data),shape:a.shape}}function ma(){let a;try{a=e(`depthwise_conv2d_${j}/depthwise`)}catch{a=e(`depthwise_conv2d_${j}/depthwise1`)}return j++,w(dr(a))}function F(){return{bn:ga(),prelu:la()}}let ya=[];function d(a,r,n){ya.push({pipe:a,bg:r,wg:n})}let o=a=>Math.ceil(a/8),Wa=a=>Math.ceil(a/64),_r=a=>Math.ceil(a/256);function f(a){let r=p(a.length*4,A);return P(r,new Uint32Array(a)),r}let Va=w(e("conv2d_81","Conv2D").data),Ia=ga(),$a=la(),ja=f([3,16,256,256,128,128]);d(Ea,c(H,[$,Va,Ia,$a,ua,ja]),[o(128),o(128),16]);let m=ua,Y=16,G=128,[k,U,S,ba]=[Na,Fa,Xa,$];function B(a,r,n,t){let L=N(),X=F(),W=f([a,r,n,n]);d(Ca,c(H,[m,L.buf,X.bn,X.prelu,k,W]),[o(n),o(n),r]);let Z=ma(),q=w(new Float32Array(r)),E=f([r,n,n,n,n,1,1]);d(ta,c(h,[k,Z,q,U,E]),[o(n),o(n),r]);let J=N(),C=F(),K=f([r,a,n,n]);if(d(na,c(h,[U,J.buf,C.bn,k,K]),[o(n),o(n),a]),t){let O=f([a,n,n]);d(oa,c(I,[k,m,C.prelu,S,O]),[o(n),o(n),a]);let T=m;m=S,S=T}else{let O=f([a,n,n]);d(ea,c(V,[k,C.prelu,U,O]),[o(n),o(n),a]);let T=m;m=U,U=T}Y=a}function M(a,r,n){let t=G/2,L=Y,X=N(),W=F(),Z=f([L,a,G,G,t,t]);d(Oa,c(h,[m,X.buf,W.bn,k,Z]),[o(t),o(t),a]);let q=f([L,G,G,t,t]);d(Ta,c(Q,[m,U,q]),[o(t),o(t),L]);let E;if(n!==null&&n>L){let ur=f([L,n,t,t]);d(Ha,c(aa,[U,S,ur]),[o(t),o(t),n]),E=S}else E=U;let J=f([a,t,t]);d(ea,c(V,[k,W.prelu,ba,J]),[o(t),o(t),a]);let C=ma(),K=w(new Float32Array(a)),O=f([a,t,t,t,t,1,1]);d(ta,c(h,[ba,C,K,m,O]),[o(t),o(t),a]);let T=N(),wa=F(),er=f([a,r,t,t]);d(na,c(h,[m,T.buf,wa.bn,k,er]),[o(t),o(t),r]);let or=f([r,t,t]);d(oa,c(I,[k,E,wa.prelu,m,or]),[o(t),o(t),r]),Y=r,G=t}for(let a=0;a<4;a++)B(16,8,128,!0);M(16,32,32);for(let a=0;a<4;a++)B(32,16,64,!0);M(32,64,64);for(let a=0;a<4;a++)B(64,32,32,!0);M(64,128,128);for(let a=0;a<4;a++)B(128,64,16,!0);M(64,128,null);for(let a=0;a<4;a++)B(128,64,8,!0);M(64,128,null);for(let a=0;a<4;a++)B(128,64,4,!0);M(64,128,null);for(let a=0;a<4;a++)B(128,64,2,!0);let Ya=w(e("conv2d_150","Conv2D").data),Za=w(e("conv2d_150","BiasAdd").data),qa=f([128,1434]);d(ia,c(h,[m,Ya,Za,sa,qa]),[Wa(1434),1,1]);let Ja=w(e("conv2d_151","Conv2D").data),Ka=w(e("conv2d_151","BiasAdd").data),Qa=f([128,1]);d(ia,c(h,[m,Ja,Ka,pa,Qa]),[1,1,1]);let ar=f([1]);d(za,c(ra,[pa,ca,ar]),[1,1,1]);let xa=3*256*256*4;function rr(a,r){r.copyBufferToBuffer(a,0,$,0,xa);let n=r.beginComputePass();for(let t of ya)n.setPipeline(t.pipe),n.setBindGroup(0,t.bg),n.dispatchWorkgroups(...t.wg);n.end(),r.copyBufferToBuffer(sa,0,z[D],0,1434*4),r.copyBufferToBuffer(ca,0,z[D],1434*4,4)}async function tr(){let a=z[D];await a.mapAsync(GPUMapMode.READ);let r=new Float32Array(a.getMappedRange().slice(0));return a.unmap(),{landmarks:r.subarray(0,1434),score:r[1434]}}function nr(){let a=z[D];return a.mapAsync(GPUMapMode.READ).then(()=>{let r=new Float32Array(a.getMappedRange().slice(0));return a.unmap(),{landmarks:r.subarray(0,1434),score:r[1434]}})}function ir(){D=1-D}return{device:i,run:rr,readback:tr,beginReadback:nr,flipReadbackBuffer:ir,inputBufferSize:xa}}export{yr as compileLandmarkModel,mr as loadLandmarkWeights,sr as loadLandmarkWeightsFromBuffer};

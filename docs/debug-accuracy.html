@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Accuracy Test — WebGPU vs TFLite Ground Truth</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0a0a0a; color: #ededed; font-family: 'SF Mono', 'Menlo', monospace; padding: 12px; font-size: 13px; }
+    h2 { font-family: system-ui; margin-bottom: 8px; font-size: 18px; }
+    .row { display: flex; gap: 4px; align-items: baseline; padding: 2px 0; }
+    .label { color: #888; min-width: 160px; }
+    .val { font-weight: 600; }
+    .ok { color: #34d399; }
+    .err { color: #ef4444; }
+    .warn { color: #fbbf24; }
+    .num { color: #60a5fa; }
+    hr { border: none; border-top: 1px solid #222; margin: 8px 0; }
+    #log { line-height: 1.5; }
+    .section { margin: 10px 0 4px 0; font-weight: 700; font-size: 14px; color: #7c6aef; }
+    .error-box { background: #1a0505; border: 1px solid #ef4444; padding: 8px; border-radius: 4px; margin: 8px 0; white-space: pre-wrap; font-size: 12px; }
+    table { border-collapse: collapse; margin: 8px 0; }
+    th, td { text-align: right; padding: 3px 10px; border-bottom: 1px solid #222; font-size: 12px; }
+    th { color: #888; font-weight: 400; }
+  </style>
+</head>
+<body>
+  <h2>Accuracy: WebGPU vs TFLite Ground Truth 🎯</h2>
+  <div id="log"></div>
+
+  <script type="module">
+    const log = document.getElementById('log');
+    function div(cls, html) {
+      const d = document.createElement('div');
+      d.className = cls;
+      d.innerHTML = html;
+      log.appendChild(d);
+      window.scrollTo(0, document.body.scrollHeight);
+      return d;
+    }
+    function row(label, value, cls = '') {
+      div('row', `<span class="label">${label}</span><span class="val ${cls}">${value}</span>`);
+    }
+    function section(title) { div('section', title); }
+    function hr_() { log.appendChild(document.createElement('hr')); }
+
+    // TFLite ground truth (from tflite_ref_test.py)
+    const TFLITE_GROUND_TRUTH = {
+      zeros: {
+        landmarks_first10: [111.47354, 164.7721, -23.082666, 116.150536, 140.2349, -41.797318, 114.39679, 148.29707, -22.509375, 113.303406],
+        lm_range: [-43.7670, 212.1979],
+        logit: -14.112994,
+        score: 0.00333818,
+      },
+      gray: {
+        landmarks_first10: [125.11026, 160.76067, -21.31932, 125.38549, 137.47122, -39.845688, 126.19448, 143.68945, -21.146126, 120.34019],
+        lm_range: [-42.9994, 218.9142],
+        logit: -14.203777,
+        score: 0.9998701,
+      },
+      ones: {
+        landmarks_first10: [129.36165, 160.50015, -21.740416, 130.4477, 138.58498, -40.55287, 130.4378, 144.97293, -21.99131, 123.8533],
+        lm_range: [-43.6958, 214.6162],
+        logit: -12.59248,
+        score: 0.9912815,
+      },
+    };
+
+    async function run() {
+      section('SYSTEM');
+      row('WebGPU', navigator.gpu ? 'YES' : 'NO', navigator.gpu ? 'ok' : 'err');
+      if (!navigator.gpu) { div('error-box', 'WebGPU not available'); return; }
+
+      const adapter = await navigator.gpu.requestAdapter();
+      const device = await adapter.requestDevice();
+      row('Device', adapter.info?.device || adapter.info?.description || 'ok', 'ok');
+
+      // Load model internals — use the face_landmark_model wrapper which is exported
+      hr_();
+      section('LOADING LANDMARK MODEL');
+      const { loadFaceLandmarkWeights, compileFaceLandmarkModel } = await import('./dist/index.js');
+      row('Module', 'loaded', 'ok');
+
+      // Load weights manually (same as what createFacemesh does)
+      const [metaRes, binRes] = await Promise.all([
+        fetch('./weights/face_landmarks_weights.json'),
+        fetch('./weights/face_landmarks_weights.bin'),
+      ]);
+      const meta = await metaRes.json();
+      const bin = await binRes.arrayBuffer();
+      const weights = loadFaceLandmarkWeights(meta, bin);
+      row('Weights', `${weights.size} tensors`, 'ok');
+
+      // Compile using the raw landmark_model (import directly for raw output)
+      const { compileLandmarkModel } = await import('./dist/landmark_model-ZPESYYE6.js');
+      // Convert weights to the format landmark_model expects
+      const lmWeights = new Map();
+      for (const [k, v] of weights) {
+        lmWeights.set(k, { data: v.data, shape: v.shape });
+      }
+      const model = await compileLandmarkModel(device, lmWeights);
+      row('Model', 'compiled (raw, no normalization)', 'ok');
+
+      // Create test input buffer (CHW format, 3*256*256 floats)
+      const INPUT_SIZE = 3 * 256 * 256;
+      const inputBuf = device.createBuffer({
+        size: INPUT_SIZE * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+      });
+
+      const testCases = [
+        { name: 'zeros', value: 0.0, gt: TFLITE_GROUND_TRUTH.zeros },
+        { name: 'gray', value: 0.5, gt: TFLITE_GROUND_TRUTH.gray },
+        { name: 'ones', value: 1.0, gt: TFLITE_GROUND_TRUTH.ones },
+      ];
+
+      for (const tc of testCases) {
+        hr_();
+        section(`INPUT: ${tc.name} (fill=${tc.value})`);
+
+        // Fill input buffer
+        const inputData = new Float32Array(INPUT_SIZE).fill(tc.value);
+        device.queue.writeBuffer(inputBuf, 0, inputData);
+
+        // Run model
+        const encoder = device.createCommandEncoder();
+        model.run(inputBuf, encoder);
+        device.queue.submit([encoder.finish()]);
+
+        const result = await model.readback();
+        const lm = result.landmarks;
+        const score = result.score;
+
+        // Compare
+        const gt = tc.gt;
+
+        row('Score (WebGPU)', score.toFixed(6), 'num');
+        row('Score (TFLite)', gt.score.toFixed(6), 'num');
+        const scoreDiff = Math.abs(score - gt.score);
+        row('Score diff', scoreDiff.toExponential(3), scoreDiff < 0.01 ? 'ok' : 'err');
+
+        // Landmarks comparison
+        row('LM range (WebGPU)', `[${Math.min(...lm).toFixed(2)}, ${Math.max(...lm).toFixed(2)}]`, 'num');
+        row('LM range (TFLite)', `[${gt.lm_range[0].toFixed(2)}, ${gt.lm_range[1].toFixed(2)}]`, 'num');
+
+        // First 10 comparison
+        let maxAbsErr = 0;
+        let totalAbsErr = 0;
+        for (let i = 0; i < 1434; i++) {
+          const err = Math.abs(lm[i] - (i < 10 ? gt.landmarks_first10[i] : 0));
+          if (i < 10) {
+            maxAbsErr = Math.max(maxAbsErr, err);
+            totalAbsErr += err;
+          }
+        }
+        const meanAbsErr = totalAbsErr / 10;
+
+        // Table of first 10 landmarks
+        let tableHtml = '<table><tr><th>idx</th><th>WebGPU</th><th>TFLite</th><th>|diff|</th></tr>';
+        for (let i = 0; i < 10; i++) {
+          const webgpu = lm[i];
+          const tflite = gt.landmarks_first10[i];
+          const diff = Math.abs(webgpu - tflite);
+          const cls = diff < 1 ? 'ok' : diff < 5 ? 'warn' : 'err';
+          tableHtml += `<tr><td>${i}</td><td>${webgpu.toFixed(4)}</td><td>${tflite.toFixed(4)}</td><td class="${cls}">${diff.toFixed(4)}</td></tr>`;
+        }
+        tableHtml += '</table>';
+        div('', tableHtml);
+
+        row('Max abs err (first 10)', maxAbsErr.toFixed(4), maxAbsErr < 1 ? 'ok' : 'err');
+        row('Mean abs err (first 10)', meanAbsErr.toFixed(4), meanAbsErr < 1 ? 'ok' : 'err');
+
+        // Full landmark error (just vs ground truth first 10, since we only have those)
+        // Also compute full range error
+        const rangeErr = Math.abs(Math.max(...lm) - gt.lm_range[1]) + Math.abs(Math.min(...lm) - gt.lm_range[0]);
+        row('Range error', rangeErr.toFixed(2), rangeErr < 10 ? 'ok' : 'err');
+      }
+
+      hr_();
+      section('DONE');
+      row('Status', 'Compare WebGPU vs TFLite above', 'num');
+    }
+
+    run().catch(e => div('error-box', `Fatal: ${e.message}\n${e.stack}`));
+  </script>
+</body>
+</html>

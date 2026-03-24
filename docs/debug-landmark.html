@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Debug Landmark Model</title>
+  <style>
+    body { background: #0a0a0a; color: #ededed; font-family: monospace; padding: 12px; font-size: 13px; }
+    .ok { color: #34d399; } .err { color: #ef4444; } .num { color: #60a5fa; }
+    .row { display: flex; gap: 4px; padding: 2px 0; }
+    .label { color: #888; min-width: 160px; }
+    .val { font-weight: 600; }
+    hr { border: none; border-top: 1px solid #222; margin: 8px 0; }
+    .section { margin: 10px 0 4px; font-weight: 700; font-size: 14px; color: #7c6aef; }
+    .error-box { background: #1a0505; border: 1px solid #ef4444; padding: 8px; border-radius: 4px; margin: 8px 0; }
+    canvas { max-width: 256px; border: 1px solid #333; margin: 6px 0; }
+  </style>
+</head>
+<body>
+  <h2>Debug Landmark Model</h2>
+  <div id="log"></div>
+  <script type="module">
+    const log = document.getElementById('log');
+    function div(cls, html) { const d = document.createElement('div'); d.className = cls; d.innerHTML = html; log.appendChild(d); return d; }
+    function row(l, v, c='') { div('row', `<span class="label">${l}</span><span class="val ${c}">${v}</span>`); }
+    function section(t) { div('section', t); }
+    function hr_() { log.appendChild(document.createElement('hr')); }
+
+    async function run() {
+      section('LOAD WEIGHTS');
+      const { compileFaceLandmarkModel, loadFaceLandmarkWeights } = await import('./dist/index.js');
+      row('Module', 'loaded', 'ok');
+
+      // Load f16 weights
+      const [metaRes, binRes] = await Promise.all([
+        fetch('./weights/face_landmarks_weights_f16.json'),
+        fetch('./weights/face_landmarks_weights_f16.bin'),
+      ]);
+      const meta = await metaRes.json();
+      const buf = await binRes.arrayBuffer();
+      row('Meta keys', meta.keys.length);
+      row('Bin size', buf.byteLength + ' bytes');
+
+      const weights = loadFaceLandmarkWeights(meta, buf);
+      row('Loaded weights', weights.size);
+
+      // Verify a specific weight
+      let stemFound = false;
+      for (const [k, v] of weights) {
+        if (k.includes('conv2d_81') && k.includes('Conv2D')) {
+          row('Stem kernel', `shape=[${v.shape}] min=${v.data[0].toFixed(4)} max=${Math.max(...v.data.slice(0,20)).toFixed(4)}`, 'ok');
+          stemFound = true;
+          break;
+        }
+      }
+      if (!stemFound) row('Stem kernel', 'NOT FOUND', 'err');
+
+      // Verify output head weight
+      for (const [k, v] of weights) {
+        if (k.includes('conv2d_150') && k.includes('Conv2D')) {
+          const min = Math.min(...Array.from(v.data.slice(0, 100)));
+          const max = Math.max(...Array.from(v.data.slice(0, 100)));
+          row('LM head kernel', `shape=[${v.shape}] range=[${min.toFixed(4)}, ${max.toFixed(4)}]`, 'ok');
+          break;
+        }
+      }
+
+      hr_();
+      section('COMPILE MODEL');
+      const model = await compileFaceLandmarkModel(weights);
+      row('Device', model.device ? 'OK' : 'FAIL', model.device ? 'ok' : 'err');
+
+      hr_();
+      section('TEST 1: Zero input (256x256 black image)');
+      const zeroInput = new Float32Array(3 * 256 * 256); // all zeros
+      const result0 = await model.run(zeroInput);
+      const lm0 = result0.landmarks;
+      const pres0 = result0.facePresence[0];
+      row('Presence raw', pres0.toFixed(6), 'num');
+      row('LM[0] (x,y,z)', `${lm0[0].toFixed(4)}, ${lm0[1].toFixed(4)}, ${lm0[2].toFixed(4)}`, 'num');
+      row('LM range', `[${Math.min(...lm0).toFixed(2)}, ${Math.max(...lm0).toFixed(2)}]`, 'num');
+
+      hr_();
+      section('TEST 2: Constant 0.5 input (gray image)');
+      const grayInput = new Float32Array(3 * 256 * 256).fill(0.5);
+      const result1 = await model.run(grayInput);
+      const lm1 = result1.landmarks;
+      const pres1 = result1.facePresence[0];
+      row('Presence raw', pres1.toFixed(6), 'num');
+      row('LM[0] (x,y,z)', `${lm1[0].toFixed(4)}, ${lm1[1].toFixed(4)}, ${lm1[2].toFixed(4)}`, 'num');
+      row('LM range', `[${Math.min(...lm1).toFixed(2)}, ${Math.max(...lm1).toFixed(2)}]`, 'num');
+
+      hr_();
+      section('TEST 3: Real face crop');
+      // Load a face image and crop center
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = reject;
+        img.src = 'https://images.pexels.com/photos/774909/pexels-photo-774909.jpeg?auto=compress&cs=tinysrgb&w=800';
+      });
+      row('Image', `${img.naturalWidth}x${img.naturalHeight}`, 'ok');
+
+      // Rough crop of face area and resize to 256x256
+      const cropCanvas = document.createElement('canvas');
+      cropCanvas.width = 256;
+      cropCanvas.height = 256;
+      const ctx = cropCanvas.getContext('2d');
+      // Face is roughly in upper-center area
+      const sx = img.naturalWidth * 0.25;
+      const sy = img.naturalHeight * 0.15;
+      const sw = img.naturalWidth * 0.5;
+      const sh = img.naturalWidth * 0.5; // square crop
+      ctx.drawImage(img, sx, sy, sw, sh, 0, 0, 256, 256);
+      log.appendChild(cropCanvas);
+
+      const result2 = await model.runFromCanvas(cropCanvas);
+      const lm2 = result2.landmarks;
+      const pres2 = result2.facePresence[0];
+      row('Presence raw', pres2.toFixed(6), 'num');
+      row('LM[0] (x,y,z)', `${lm2[0].toFixed(4)}, ${lm2[1].toFixed(4)}, ${lm2[2].toFixed(4)}`, 'num');
+      row('LM[1] nose (x,y,z)', `${lm2[3].toFixed(4)}, ${lm2[4].toFixed(4)}, ${lm2[5].toFixed(4)}`, 'num');
+      row('LM range', `[${Math.min(...lm2).toFixed(2)}, ${Math.max(...lm2).toFixed(2)}]`, 'num');
+      // Expected: landmarks in [0,1] range (after our /256 normalization)
+      // Reference TFLite gives [14, 247] raw → [0.055, 0.965] after /256
+
+      // Draw landmarks on crop
+      const drawCanvas = document.createElement('canvas');
+      drawCanvas.width = 256;
+      drawCanvas.height = 256;
+      const dctx = drawCanvas.getContext('2d');
+      dctx.drawImage(cropCanvas, 0, 0);
+      dctx.fillStyle = '#34d399';
+      for (let i = 0; i < 478; i++) {
+        const x = lm2[i*3] * 256;  // already normalized to [0,1]
+        const y = lm2[i*3+1] * 256;
+        dctx.beginPath();
+        dctx.arc(x, y, 2, 0, Math.PI*2);
+        dctx.fill();
+      }
+      log.appendChild(drawCanvas);
+
+      hr_();
+      row('Done', 'OK', 'ok');
+    }
+
+    run().catch(e => div('error-box', `Fatal: ${e.message}<br><pre>${e.stack}</pre>`));
+  </script>
+</body>
+</html>

@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Debug Stem Layer</title>
+  <style>
+    body { background: #0a0a0a; color: #ededed; font-family: monospace; padding: 12px; font-size: 13px; }
+    .ok { color: #34d399; } .err { color: #ef4444; } .num { color: #60a5fa; }
+    .row { display: flex; gap: 4px; padding: 2px 0; }
+    .label { color: #888; min-width: 200px; }
+    .val { font-weight: 600; }
+    .section { margin: 10px 0 4px; font-weight: 700; font-size: 14px; color: #7c6aef; }
+  </style>
+</head>
+<body>
+  <h2>Debug Stem + Manual Conv</h2>
+  <div id="log"></div>
+  <script type="module">
+    const log = document.getElementById('log');
+    function row(l, v, c='') {
+      const d = document.createElement('div');
+      d.className = 'row';
+      d.innerHTML = `<span class="label">${l}</span><span class="val ${c}">${v}</span>`;
+      log.appendChild(d);
+    }
+    function section(t) {
+      const d = document.createElement('div');
+      d.className = 'section';
+      d.textContent = t;
+      log.appendChild(d);
+    }
+
+    async function run() {
+      section('LOAD WEIGHTS');
+      const { loadFaceLandmarkWeights } = await import('./dist/index.js');
+
+      const [metaRes, binRes] = await Promise.all([
+        fetch('./weights/face_landmarks_weights_f16.json'),
+        fetch('./weights/face_landmarks_weights_f16.bin'),
+      ]);
+      const meta = await metaRes.json();
+      const buf = await binRes.arrayBuffer();
+      const weights = loadFaceLandmarkWeights(meta, buf);
+      row('Loaded', `${weights.size} weights`, 'ok');
+
+      // Get specific weights
+      function fw(...subs) {
+        for (const [k, v] of weights) {
+          if (subs.every(s => k.includes(s))) return v;
+        }
+        throw new Error(`Not found: ${subs}`);
+      }
+
+      const stemKernel = fw('conv2d_81', 'Conv2D');
+      const stemBias = fw('batch_normalization_132');
+      const stemAlpha = fw('p_re_lu_126');
+
+      row('Stem kernel', `shape=[${stemKernel.shape}] first5=[${stemKernel.data.slice(0,5).map(v=>v.toFixed(4))}]`);
+      row('Stem bias', `[${stemBias.data.map(v=>v.toFixed(4))}]`);
+      row('Stem alpha', `[${stemAlpha.data.map(v=>v.toFixed(4))}]`);
+
+      section('CPU STEM CONV (zero input, expected = bias)');
+      // For zero input, conv output = bias for each channel
+      // Then PReLU: if bias >= 0, output = bias; if bias < 0, output = bias * alpha
+      const expected = new Float32Array(16);
+      for (let c = 0; c < 16; c++) {
+        const bias = stemBias.data[c];
+        if (bias >= 0) {
+          expected[c] = bias;
+        } else {
+          expected[c] = bias * stemAlpha.data[c];
+        }
+      }
+      row('CPU stem+PReLU (zero in)', `[${Array.from(expected).map(v=>v.toFixed(6))}]`);
+
+      section('GPU STEM CONV');
+      const adapter = await navigator.gpu.requestAdapter();
+      const device = await adapter.requestDevice();
+
+      // Create input buffer (3 * 256 * 256 = 196608 floats, all zero)
+      const inputSize = 3 * 256 * 256 * 4;
+      const inputBuf = device.createBuffer({ size: inputSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(inputBuf, 0, new Float32Array(3 * 256 * 256));
+
+      // Output buffer: 16 * 128 * 128 = 262144 floats
+      const outSize = 16 * 128 * 128 * 4;
+      const outBuf = device.createBuffer({ size: outSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+
+      // Upload weights
+      function upload(data) {
+        const b = device.createBuffer({ size: data.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        device.queue.writeBuffer(b, 0, data);
+        return b;
+      }
+      const wBuf = upload(stemKernel.data);
+      const bBuf = upload(stemBias.data);
+      const aBuf = upload(stemAlpha.data);
+      const uBuf = device.createBuffer({ size: 24, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(uBuf, 0, new Uint32Array([3, 16, 256, 256, 128, 128]));
+
+      // Create the stem shader - EXACT same as in landmark_shaders.ts
+      const stemCode = `
+struct Params { in_channels:u32, out_channels:u32, in_h:u32, in_w:u32, out_h:u32, out_w:u32, }
+@group(0)@binding(0) var<storage,read> input:array<f32>;
+@group(0)@binding(1) var<storage,read> weight:array<f32>;
+@group(0)@binding(2) var<storage,read> bias:array<f32>;
+@group(0)@binding(3) var<storage,read> alpha:array<f32>;
+@group(0)@binding(4) var<storage,read_write> output:array<f32>;
+@group(0)@binding(5) var<uniform> params:Params;
+@compute @workgroup_size(8,8,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>){
+  let out_x=gid.x; let out_y=gid.y; let oc=gid.z;
+  if(out_x>=params.out_w||out_y>=params.out_h||oc>=params.out_channels){return;}
+  var sum:f32=0.0;
+  let in_h=i32(params.in_h); let in_w=i32(params.in_w);
+  for(var ic:u32=0u;ic<params.in_channels;ic++){
+    for(var ky:u32=0u;ky<3u;ky++){
+      for(var kx:u32=0u;kx<3u;kx++){
+        let iy=i32(out_y*2u+ky);
+        let ix=i32(out_x*2u+kx);
+        if(iy>=0 && iy<in_h && ix>=0 && ix<in_w){
+          let in_idx=ic*params.in_h*params.in_w+u32(iy)*params.in_w+u32(ix);
+          let w_idx=oc*9u*params.in_channels+ky*3u*params.in_channels+kx*params.in_channels+ic;
+          sum+=input[in_idx]*weight[w_idx];
+        }
+      }
+    }
+  }
+  sum+=bias[oc];
+  if(sum<0.0){ sum=sum*alpha[oc]; }
+  let out_idx=oc*params.out_h*params.out_w+out_y*params.out_w+out_x;
+  output[out_idx]=sum;
+}`;
+
+      const layout = device.createBindGroupLayout({
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+          { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+          { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+          { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+          { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+          { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        ]
+      });
+
+      const pipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+        compute: { module: device.createShaderModule({ code: stemCode }), entryPoint: 'main' },
+      });
+
+      const bg = device.createBindGroup({
+        layout,
+        entries: [
+          { binding: 0, resource: { buffer: inputBuf } },
+          { binding: 1, resource: { buffer: wBuf } },
+          { binding: 2, resource: { buffer: bBuf } },
+          { binding: 3, resource: { buffer: aBuf } },
+          { binding: 4, resource: { buffer: outBuf } },
+          { binding: 5, resource: { buffer: uBuf } },
+        ]
+      });
+
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(Math.ceil(128/8), Math.ceil(128/8), 16);
+      pass.end();
+
+      const readBuf = device.createBuffer({ size: outSize, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      enc.copyBufferToBuffer(outBuf, 0, readBuf, 0, outSize);
+      device.queue.submit([enc.finish()]);
+
+      await readBuf.mapAsync(GPUMapMode.READ);
+      const result = new Float32Array(readBuf.getMappedRange().slice(0));
+      readBuf.unmap();
+
+      // CHW layout: channel c, pixel (0,0) is at index c * 128 * 128
+      const pixelZero = new Float32Array(16);
+      for (let c = 0; c < 16; c++) {
+        pixelZero[c] = result[c * 128 * 128];
+      }
+      row('GPU stem+PReLU pixel[0,0]', `[${Array.from(pixelZero).map(v=>v.toFixed(6))}]`);
+      row('GPU vs CPU match?', pixelZero.every((v, i) => Math.abs(v - expected[i]) < 0.001) ? 'YES' : 'NO',
+          pixelZero.every((v, i) => Math.abs(v - expected[i]) < 0.001) ? 'ok' : 'err');
+
+      // Check spatial stats
+      for (let c = 0; c < 16; c++) {
+        const offset = c * 128 * 128;
+        let min = Infinity, max = -Infinity, sum2 = 0;
+        for (let i = 0; i < 128 * 128; i++) {
+          const v = result[offset + i];
+          if (v < min) min = v;
+          if (v > max) max = v;
+          sum2 += v;
+        }
+        if (c < 4 || c === 7 || c === 8) {
+          row(`  ch ${c} (bias=${stemBias.data[c].toFixed(4)})`,
+              `min=${min.toFixed(4)} max=${max.toFixed(4)} mean=${(sum2/16384).toFixed(4)}`);
+        }
+      }
+
+      section('FULL MODEL RUN (zero input)');
+      const { compileFaceLandmarkModel } = await import('./dist/index.js');
+      const model = await compileFaceLandmarkModel(weights, device);
+      const fullResult = await model.run(new Float32Array(3 * 256 * 256));
+      const lm = fullResult.landmarks;
+      const pres = fullResult.facePresence[0];
+      row('Presence raw', pres.toFixed(6), 'num');
+      row('LM[0] (x,y,z)', `${lm[0].toFixed(4)}, ${lm[1].toFixed(4)}, ${lm[2].toFixed(4)}`, 'num');
+      row('LM range', `[${Math.min(...lm).toFixed(2)}, ${Math.max(...lm).toFixed(2)}]`, 'num');
+
+      row('Done', 'OK', 'ok');
+    }
+
+    run().catch(e => {
+      const d = document.createElement('div');
+      d.style.cssText = 'background:#1a0505;border:1px solid #ef4444;padding:8px;margin:8px 0;';
+      d.innerHTML = `Fatal: ${e.message}<br><pre>${e.stack}</pre>`;
+      log.appendChild(d);
+    });
+  </script>
+</body>
+</html>
