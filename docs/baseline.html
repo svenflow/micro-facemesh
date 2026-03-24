@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MediaPipe FaceMesh Baseline Benchmark</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0a0a0a; color: #ededed; font-family: 'SF Mono', 'Menlo', monospace; padding: 12px; font-size: 13px; }
+    h2 { font-family: system-ui; margin-bottom: 8px; font-size: 18px; }
+    .row { display: flex; gap: 4px; align-items: baseline; padding: 2px 0; }
+    .label { color: #888; min-width: 140px; }
+    .val { font-weight: 600; }
+    .ok { color: #34d399; }
+    .err { color: #ef4444; }
+    .warn { color: #fbbf24; }
+    .num { color: #60a5fa; }
+    .dim { color: #555; }
+    hr { border: none; border-top: 1px solid #222; margin: 8px 0; }
+    canvas { max-width: 200px; border: 1px solid #333; margin: 6px 4px; border-radius: 4px; }
+    #log { line-height: 1.5; }
+    .section { margin: 10px 0 4px 0; font-weight: 700; font-size: 14px; }
+    .section-gpu { color: #ef8f24; }
+    .section-cpu { color: #c084fc; }
+    .section-sys { color: #7c6aef; }
+    .section-summary { color: #60a5fa; }
+    .error-box { background: #1a0505; border: 1px solid #ef4444; padding: 8px; border-radius: 4px; margin: 8px 0; }
+    table { border-collapse: collapse; margin: 8px 0; width: 100%; }
+    th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #222; }
+    th { color: #888; font-weight: 400; }
+    td { font-weight: 600; }
+    .winner { color: #34d399; }
+    .canvas-row { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0; }
+    .img-card { text-align: center; }
+    .img-card canvas { display: block; }
+    .img-card .caption { font-size: 11px; color: #666; }
+  </style>
+</head>
+<body>
+  <h2>MediaPipe FaceMesh Baseline 🧑</h2>
+  <p style="color:#888;margin-bottom:8px;">GPU vs WASM × 10 face images, 5 runs each</p>
+  <div id="log"></div>
+
+  <script type="module">
+    const log = document.getElementById('log');
+
+    function div(cls, html) {
+      const d = document.createElement('div');
+      d.className = cls;
+      d.innerHTML = html;
+      log.appendChild(d);
+      window.scrollTo(0, document.body.scrollHeight);
+      return d;
+    }
+    function row(label, value, cls = '') {
+      div('row', `<span class="label">${label}</span><span class="val ${cls}">${value}</span>`);
+    }
+    function section(title, cls = 'section-sys') { div(`section ${cls}`, title); }
+    function hr_() { const h = document.createElement('hr'); log.appendChild(h); }
+
+    const IMAGES = [
+      { url: 'https://images.pexels.com/photos/3885344/pexels-photo-3885344.jpeg?auto=compress&cs=tinysrgb&w=800', name: 'South Asian man' },
+      { url: 'https://images.pexels.com/photos/356147/pexels-photo-356147.jpeg?auto=compress&cs=tinysrgb&w=800', name: 'Man frontal' },
+      { url: 'https://images.pexels.com/photos/2743754/pexels-photo-2743754.jpeg?auto=compress&cs=tinysrgb&w=800', name: 'Man close-up' },
+      { url: 'https://images.pexels.com/photos/1054422/pexels-photo-1054422.jpeg?auto=compress&cs=tinysrgb&w=800', name: 'Woman blue eyes' },
+      { url: 'https://images.pexels.com/photos/3373716/pexels-photo-3373716.jpeg?auto=compress&cs=tinysrgb&w=800', name: 'Woman soft light' },
+      { url: 'https://images.pexels.com/photos/11511808/pexels-photo-11511808.jpeg?auto=compress&cs=tinysrgb&w=800', name: 'Elderly man' },
+      { url: 'https://upload.wikimedia.org/wikipedia/commons/thumb/a/a3/Elderly_Gambian_woman_face_portrait.jpg/960px-Elderly_Gambian_woman_face_portrait.jpg', name: 'Gambian woman' },
+      { url: 'https://upload.wikimedia.org/wikipedia/commons/thumb/a/a4/Sikh_man%2C_Agra_10.jpg/960px-Sikh_man%2C_Agra_10.jpg', name: 'Sikh man' },
+      { url: 'https://upload.wikimedia.org/wikipedia/commons/thumb/e/e7/Boy_Face_from_Venezuela.jpg/960px-Boy_Face_from_Venezuela.jpg', name: 'Venezuelan boy' },
+      { url: 'https://upload.wikimedia.org/wikipedia/commons/thumb/1/1d/Nepali_woman%2C_Ghyaru.jpg/960px-Nepali_woman%2C_Ghyaru.jpg', name: 'Nepali woman' },
+    ];
+
+    const WARMUP_RUNS = 2;
+    const TIMED_RUNS = 5;
+
+    async function loadImage(url) {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = () => reject(new Error('Failed: ' + url.substring(0, 60)));
+        img.src = url;
+      });
+      return img;
+    }
+
+    function drawLandmarks(canvas, img, landmarks) {
+      canvas.width = 200;
+      canvas.height = Math.round(200 * img.naturalHeight / img.naturalWidth);
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+      if (!landmarks || landmarks.length === 0) return;
+
+      const face = landmarks[0];
+      ctx.fillStyle = '#34d399';
+      for (const lm of face) {
+        ctx.beginPath();
+        ctx.arc(lm.x * canvas.width, lm.y * canvas.height, 0.8, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    function stats(times) {
+      const sorted = [...times].sort((a, b) => a - b);
+      const avg = times.reduce((s, t) => s + t, 0) / times.length;
+      const median = sorted[Math.floor(sorted.length / 2)];
+      const min = sorted[0];
+      const max = sorted[sorted.length - 1];
+      return { avg, median, min, max, fps: 1000 / median };
+    }
+
+    async function benchmarkMode(faceLandmarker, images, modeName, sectionCls) {
+      hr_();
+      section(`${modeName}`, sectionCls);
+
+      const allTimes = [];
+      const perImage = [];
+      const canvasRow = div('canvas-row', '');
+
+      for (let i = 0; i < images.length; i++) {
+        const img = images[i];
+        const bmp = await createImageBitmap(img.el);
+
+        // Warmup
+        for (let w = 0; w < WARMUP_RUNS; w++) {
+          faceLandmarker.detect(bmp);
+        }
+
+        // Timed runs
+        const times = [];
+        let result;
+        for (let r = 0; r < TIMED_RUNS; r++) {
+          const t0 = performance.now();
+          result = faceLandmarker.detect(bmp);
+          const dt = performance.now() - t0;
+          times.push(dt);
+        }
+
+        const s = stats(times);
+        allTimes.push(...times);
+        perImage.push({ name: img.name, ...s, faces: result.faceLandmarks.length, score: result.faceLandmarks.length > 0 ? 1 : 0 });
+
+        // Draw
+        const card = document.createElement('div');
+        card.className = 'img-card';
+        const canvas = document.createElement('canvas');
+        drawLandmarks(canvas, img.el, result.faceLandmarks);
+        card.appendChild(canvas);
+        card.innerHTML += `<div class="caption">${img.name}<br>${s.median.toFixed(1)}ms</div>`;
+        canvasRow.appendChild(card);
+
+        row(`${img.name}`, `${s.median.toFixed(1)}ms median, ${s.faces} face(s)`, 'num');
+      }
+
+      const overall = stats(allTimes);
+      hr_();
+      row('Overall avg', overall.avg.toFixed(1) + 'ms', 'num');
+      row('Overall median', overall.median.toFixed(1) + 'ms', 'num');
+      row('Overall FPS', overall.fps.toFixed(1), 'num');
+      row('Detection rate', perImage.filter(p => p.faces > 0).length + '/' + perImage.length, 'ok');
+
+      return { overall, perImage };
+    }
+
+    async function run() {
+      section('SYSTEM', 'section-sys');
+      row('UA', navigator.userAgent.substring(0, 80));
+      row('Screen', `${screen.width}x${screen.height} @${devicePixelRatio}x`);
+      row('WebGPU', navigator.gpu ? 'YES' : 'NO', navigator.gpu ? 'ok' : 'warn');
+
+      // Load images
+      hr_();
+      section('LOADING IMAGES', 'section-sys');
+      const images = [];
+      for (const imgDef of IMAGES) {
+        try {
+          const el = await loadImage(imgDef.url);
+          images.push({ ...imgDef, el });
+          row(imgDef.name, `${el.naturalWidth}x${el.naturalHeight}`, 'ok');
+        } catch (e) {
+          row(imgDef.name, 'FAILED', 'err');
+        }
+      }
+      row('Loaded', `${images.length}/${IMAGES.length}`, images.length === IMAGES.length ? 'ok' : 'warn');
+
+      // Load MediaPipe
+      hr_();
+      section('LOADING MEDIAPIPE', 'section-sys');
+      const { FaceLandmarker, FilesetResolver } = await import(
+        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/+esm'
+      );
+      row('Module', 'loaded', 'ok');
+
+      const vision = await FilesetResolver.forVisionTasks(
+        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm'
+      );
+      row('WASM fileset', 'loaded', 'ok');
+
+      // ── GPU mode ──
+      let gpuResult = null;
+      try {
+        const t0 = performance.now();
+        const gpuLandmarker = await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+            delegate: 'GPU',
+          },
+          runningMode: 'IMAGE',
+          numFaces: 1,
+          outputFaceBlendshapes: false,
+          outputFacialTransformationMatrixes: false,
+        });
+        row('GPU init', (performance.now() - t0).toFixed(0) + 'ms', 'num');
+        gpuResult = await benchmarkMode(gpuLandmarker, images, '② MediaPipe GPU (WASM+WebGL)', 'section-gpu');
+        gpuLandmarker.close();
+      } catch (e) {
+        div('error-box', `GPU mode failed: ${e.message}`);
+      }
+
+      // ── CPU mode ──
+      let cpuResult = null;
+      try {
+        const t0 = performance.now();
+        const cpuLandmarker = await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+            delegate: 'CPU',
+          },
+          runningMode: 'IMAGE',
+          numFaces: 1,
+          outputFaceBlendshapes: false,
+          outputFacialTransformationMatrixes: false,
+        });
+        row('CPU init', (performance.now() - t0).toFixed(0) + 'ms', 'num');
+        cpuResult = await benchmarkMode(cpuLandmarker, images, '③ MediaPipe CPU (WASM)', 'section-cpu');
+        cpuLandmarker.close();
+      } catch (e) {
+        div('error-box', `CPU mode failed: ${e.message}`);
+      }
+
+      // ── Summary ──
+      hr_();
+      section('SUMMARY TABLE', 'section-summary');
+
+      let tableHtml = '<table><tr><th>Mode</th><th>Avg</th><th>Median</th><th>Min</th><th>Max</th><th>FPS</th></tr>';
+      if (gpuResult) {
+        const g = gpuResult.overall;
+        tableHtml += `<tr><td>MediaPipe GPU</td><td>${g.avg.toFixed(1)}ms</td><td>${g.median.toFixed(1)}ms</td><td>${g.min.toFixed(1)}ms</td><td>${g.max.toFixed(1)}ms</td><td>${g.fps.toFixed(1)}</td></tr>`;
+      }
+      if (cpuResult) {
+        const c = cpuResult.overall;
+        tableHtml += `<tr><td>MediaPipe CPU</td><td>${c.avg.toFixed(1)}ms</td><td>${c.median.toFixed(1)}ms</td><td>${c.min.toFixed(1)}ms</td><td>${c.max.toFixed(1)}ms</td><td>${c.fps.toFixed(1)}</td></tr>`;
+      }
+      tableHtml += '<tr><td class="winner">micro-facemesh</td><td colspan="5">coming soon...</td></tr>';
+      tableHtml += '</table>';
+      div('', tableHtml);
+
+      // Per-image comparison
+      hr_();
+      section('PER-IMAGE DETAIL', 'section-summary');
+      let detailHtml = '<table><tr><th>Image</th><th>GPU (ms)</th><th>CPU (ms)</th><th>Faces</th></tr>';
+      for (let i = 0; i < images.length; i++) {
+        const gpuMs = gpuResult?.perImage[i]?.median?.toFixed(1) ?? '—';
+        const cpuMs = cpuResult?.perImage[i]?.median?.toFixed(1) ?? '—';
+        const faces = gpuResult?.perImage[i]?.faces ?? cpuResult?.perImage[i]?.faces ?? '—';
+        detailHtml += `<tr><td>${images[i].name}</td><td>${gpuMs}</td><td>${cpuMs}</td><td>${faces}</td></tr>`;
+      }
+      detailHtml += '</table>';
+      div('', detailHtml);
+
+      hr_();
+      row('Status', 'BASELINE COMPLETE', 'ok');
+    }
+
+    run().catch(e => div('error-box', `Fatal: ${e.message}<br><pre>${e.stack}</pre>`));
+  </script>
+</body>
+</html>

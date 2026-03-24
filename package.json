@@ -1,0 +1,56 @@
+{
+  "name": "@svenflow/micro-facemesh",
+  "publishConfig": {
+    "access": "public"
+  },
+  "version": "0.1.0",
+  "description": "WebGPU-powered face landmark detection. Faster than MediaPipe, zero dependencies.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/svenflow/micro-facemesh"
+  },
+  "homepage": "https://svenflow.github.io/micro-facemesh/",
+  "bugs": {
+    "url": "https://github.com/svenflow/micro-facemesh/issues"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --minify",
+    "dev": "tsup src/index.ts --format esm --dts --watch",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build && npm run typecheck"
+  },
+  "keywords": [
+    "face",
+    "mesh",
+    "landmark",
+    "detection",
+    "webgpu",
+    "mediapipe",
+    "blazeface",
+    "facemesh",
+    "realtime",
+    "ml",
+    "ai"
+  ],
+  "devDependencies": {
+    "@webgpu/types": "^0.1.40",
+    "tsup": "^8.0.0",
+    "typescript": "^5.3.0"
+  },
+  "files": [
+    "dist",
+    "weights",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "license": "MIT"
+}
